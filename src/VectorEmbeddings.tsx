@@ -415,11 +415,20 @@ export function VectorEmbeddings() {
 
   const handleEmbed = useCallback(
     (id: number) => {
+      if (embedding !== null) return;
+
       if (embedded.has(id)) {
-        setSelected(id);
+        setEmbedded((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+        setSelected((prev) => (prev === id ? null : prev));
+        if (compareA === id) setCompareA("");
+        if (compareB === id) setCompareB("");
         return;
       }
-      if (embedding !== null) return;
+
       setEmbedding(id);
       setSelected(id);
       setTimeout(() => {
@@ -427,7 +436,7 @@ export function VectorEmbeddings() {
         setEmbedding(null);
       }, 600);
     },
-    [embedded, embedding],
+    [embedded, embedding, compareA, compareB],
   );
 
   const handleEmbedAll = useCallback(() => {
@@ -698,6 +707,8 @@ export function VectorEmbeddings() {
                 textAlign="center"
               >
                 Click a sample text or image to embed it.
+                <br />
+                Click an embedded item again to deselect it.
                 <br />
                 The embedding vector will appear here.
               </Typography>
