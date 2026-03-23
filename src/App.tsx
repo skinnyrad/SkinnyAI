@@ -16,11 +16,13 @@ import LightModeRoundedIcon from "@mui/icons-material/LightModeRounded";
 import DarkModeRoundedIcon from "@mui/icons-material/DarkModeRounded";
 import { NeuralNetworks } from "./NeuralNetworks";
 import { TextGeneration } from "./TextGeneration";
+import { VectorEmbeddings } from "./VectorEmbeddings";
 import "./index.css";
 
 const TABS = [
-  { label: "Neural Networks", icon: <span className="material-symbols-rounded">neurology</span>, component: <NeuralNetworks /> },
-  { label: "Text Generation", icon: <span className="material-symbols-rounded">text_fields</span>, component: <TextGeneration /> },
+  { label: "Neural Networks",  component: <NeuralNetworks /> },
+  { label: "Text Generation",  component: <TextGeneration /> },
+  { label: "VECTOR EMBEDDINGS", component: <VectorEmbeddings /> },
 ];
 
 export function App() {
