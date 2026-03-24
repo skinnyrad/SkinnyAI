@@ -15,10 +15,16 @@ import { ThemeProvider, createTheme } from "@mui/material/styles";
 import LightModeRoundedIcon from "@mui/icons-material/LightModeRounded";
 import DarkModeRoundedIcon from "@mui/icons-material/DarkModeRounded";
 import { NeuralNetworks } from "./NeuralNetworks";
+import { TextGeneration } from "./TextGeneration";
+import { VectorEmbeddings } from "./VectorEmbeddings";
+import { AIAgents } from "./AIAgents";
 import "./index.css";
 
 const TABS = [
-  { label: "Neural Networks", icon: <span className="material-symbols-rounded">neurology</span>, component: <NeuralNetworks /> },
+  { label: "Neural Networks",  component: <NeuralNetworks /> },
+  { label: "Text Generation",  component: <TextGeneration /> },
+  { label: "VECTOR EMBEDDINGS", component: <VectorEmbeddings /> },
+  { label: "AI Agents", component: <AIAgents /> },
 ];
 
 export function App() {
@@ -54,7 +60,7 @@ export function App() {
             sx={{ "& .MuiTab-root": { fontWeight: 600, opacity: 0.7, color: "#000", "&.Mui-selected": { opacity: 1, color: "#000" } } }}
           >
             {TABS.map((t, i) => (
-              <Tab key={i} label={t.label} icon={t.icon} iconPosition="start" />
+              <Tab key={i} label={t.label} />
             ))}
           </Tabs>
           <Box sx={{ flexGrow: 1 }} />
