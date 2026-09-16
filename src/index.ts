@@ -92,6 +92,49 @@ const server = serve({
         }
       },
     },
+    "/api/ollama/embed": {
+      async POST(req) {
+        try {
+          const body = (await req.json()) as {
+            model: string;
+            inputs: string[];
+          };
+          if (!body.model || !Array.isArray(body.inputs) || body.inputs.length === 0) {
+            return Response.json(
+              { error: "Missing required fields: model, inputs (non-empty array)." },
+              { status: 400 },
+            );
+          }
+          if (body.inputs.length > 5) {
+            return Response.json(
+              { error: "Too many inputs: maximum 5 sentences." },
+              { status: 400 },
+            );
+          }
+          const res = await fetch("http://localhost:11434/api/embed", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: body.model,
+              input: body.inputs,
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            return Response.json(
+              { error: data?.error ?? "Ollama embed request failed." },
+              { status: res.status },
+            );
+          }
+          return Response.json({ embeddings: data.embeddings ?? [] });
+        } catch {
+          return Response.json(
+            { error: "Could not reach Ollama on localhost:11434. Is `ollama serve` running?" },
+            { status: 502 },
+          );
+        }
+      },
+    },
     "/api/hello": {
       async GET(req) {
         return Response.json({

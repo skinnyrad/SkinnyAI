@@ -1,58 +1,130 @@
-import { useState, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import {
   Box,
   Typography,
   Paper,
   Divider,
   Button,
-  useTheme,
-  Stack,
-  CircularProgress,
-  FormControl,
-  InputLabel,
+  TextField,
   Select,
   MenuItem,
+  FormControl,
+  InputLabel,
+  Alert,
+  Stack,
+  IconButton,
+  Tooltip,
+  CircularProgress,
+  useTheme,
 } from "@mui/material";
-import CheckCircleRoundedIcon from "@mui/icons-material/CheckCircleRounded";
-import RestartAltRoundedIcon from "@mui/icons-material/RestartAltRounded";
+import DeleteRoundedIcon from "@mui/icons-material/DeleteRounded";
+import AddRoundedIcon from "@mui/icons-material/AddRounded";
+import {
+  CACHED_NOMIC_EMBEDDINGS,
+} from "./cachedNomicEmbeddings";
 
-// ─── Seeded PRNG (Mulberry32) ─────────────────────────────
+const MAX_SENTENCES = 5;
 
-function mulberry32(seed: number): () => number {
-  return () => {
-    seed |= 0;
-    seed = (seed + 0x6d2b79f5) | 0;
-    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+const COLORS = ["#26BDC0", "#FF5A00", "#7C4DFF", "#43A047", "#E91E63"];
+
+const DEFAULT_SENTENCES = [
+  "The cat sat on the mat",
+  "A kitten curled up on the couch",
+  "My cat loves to chase yarn",
+  "Quantum computers use qubits to perform calculations",
+];
+
+interface OllamaModel {
+  name: string;
+  model: string;
+  capabilities?: string[] | null;
+  details?: {
+    parameter_size?: string;
+  } | null;
+}
+
+function parameterCount(size: string | undefined): number {
+  if (!size) return Number.POSITIVE_INFINITY;
+  const m = size.trim().match(/^([\d.]+)\s*([KMGT])?/i);
+  if (!m) return Number.POSITIVE_INFINITY;
+  const multipliers: Record<string, number> = {
+    K: 1e3,
+    M: 1e6,
+    G: 1e9,
+    B: 1e9,
+    T: 1e12,
   };
+  const unit = (m[2] ?? "").toUpperCase();
+  return Number.parseFloat(m[1]!) * (multipliers[unit] ?? 1);
 }
 
-// ─── Vector Utilities ─────────────────────────────────────
-
-const DIMS = 768;
-const SHOW_DIMS = 16;
-
-function generateUnitVector(seed: number): number[] {
-  const rng = mulberry32(seed);
-  const v = Array.from({ length: DIMS }, () => rng() * 2 - 1);
-  const norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0));
-  return v.map((x) => x / norm);
+interface Sentence {
+  id: number;
+  text: string;
+  color: string;
+  embedding: number[] | null;
 }
 
-function mixAndNormalize(
-  components: { dir: number[]; weight: number }[],
-  noiseSeed: number,
-  noiseScale = 0.03,
-): number[] {
-  const result = new Array<number>(DIMS).fill(0);
-  for (const { dir, weight } of components) {
-    for (let i = 0; i < DIMS; i++) result[i] += dir[i]! * weight;
+// True for nomic embedding models ("nomic-embed-text", "nomic-embed-text:latest", …).
+function isNomicModel(name: string): boolean {
+  return name.toLowerCase().includes("nomic");
+}
+
+// Bundled precomputed vectors apply only to the nomic model.
+function cachedEmbeddingFor(text: string, modelName: string): number[] | null {
+  if (!isNomicModel(modelName)) return null;
+  return CACHED_NOMIC_EMBEDDINGS[text] ?? null;
+}
+
+// ─── PCA via Gram matrix (n ≤ 5, d = 768) ────────────────────
+// G = Xc·Xcᵀ (n×n). Top-2 eigenpairs of G give PCA scores:
+// coord_i = sqrt(λ) · v[i]. Cheap and exact for tiny n.
+
+function powerIteration(matrix: number[][], iterations = 200): { value: number; vector: number[] } {
+  const n = matrix.length;
+  let v = Array.from({ length: n }, (_, i) => i + 1);
+  let norm = Math.sqrt(v.reduce((s, x) => s + x * x, 0)) || 1;
+  v = v.map((x) => x / norm);
+  for (let k = 0; k < iterations; k++) {
+    const w = matrix.map((row) => row.reduce((s, x, j) => s + x * v[j]!, 0));
+    norm = Math.sqrt(w.reduce((s, x) => s + x * x, 0));
+    if (norm < 1e-12) break;
+    v = w.map((x) => x / norm);
   }
-  const rng = mulberry32(noiseSeed);
-  for (let i = 0; i < DIMS; i++) result[i] += (rng() * 2 - 1) * noiseScale;
-  const norm = Math.sqrt(result.reduce((s, x) => s + x * x, 0));
-  return result.map((x) => x / norm);
+  const mv = matrix.map((row) => row.reduce((s, x, j) => s + x * v[j]!, 0));
+  const value = v.reduce((s, x, i) => s + x * mv[i]!, 0);
+  return { value, vector: v };
+}
+
+function pca2D(embeddings: number[][]): { x: number; y: number }[] {
+  const n = embeddings.length;
+  if (n === 0) return [];
+  if (n === 1) return [{ x: 0, y: 0 }];
+  const d = embeddings[0]!.length;
+
+  const mean = new Array<number>(d).fill(0);
+  for (const e of embeddings) for (let j = 0; j < d; j++) mean[j]! += e[j]! / n;
+  const xc = embeddings.map((e) => e.map((x, j) => x - mean[j]!));
+
+  const G = xc.map((a) => xc.map((b) => a.reduce((s, x, j) => s + x * b[j]!, 0)));
+
+  const first = powerIteration(G);
+  const deflated = G.map((row, i) =>
+    row.map((x, j) => x - first.value * first.vector[i]! * first.vector[j]!),
+  );
+  const second = powerIteration(deflated);
+
+  const s1 = Math.sqrt(Math.max(first.value, 0));
+  const s2 = Math.sqrt(Math.max(second.value, 0));
+  const pts = xc.map((_, i) => ({
+    x: s1 * first.vector[i]!,
+    y: s2 * second.vector[i]!,
+  }));
+
+  // If second component is degenerate (e.g. n = 2), spread along x only.
+  const maxAbs = Math.max(...pts.flatMap((p) => [Math.abs(p.x), Math.abs(p.y)]), 1e-12);
+  const scale = 80 / maxAbs;
+  return pts.map((p) => ({ x: p.x * scale, y: p.y * scale }));
 }
 
 function cosineSim(a: number[], b: number[]): number {
@@ -64,312 +136,86 @@ function cosineSim(a: number[], b: number[]): number {
     nA += a[i]! * a[i]!;
     nB += b[i]! * b[i]!;
   }
-  return dot / (Math.sqrt(nA) * Math.sqrt(nB));
+  return dot / (Math.sqrt(nA) * Math.sqrt(nB) || 1);
 }
 
-// ─── Semantic Directions (deterministic seeds) ────────────
-
-const D_ANIMAL = generateUnitVector(42);
-const D_NATURE = generateUnitVector(137);
-const D_FINANCE = generateUnitVector(256);
-const D_VEHICLE = generateUnitVector(389);
-const D_DOMESTIC = generateUnitVector(512);
-
-// ─── Sample Items ─────────────────────────────────────────
-
-type ItemType = "text" | "image";
-
-interface SampleItem {
-  id: number;
-  type: ItemType;
-  label: string;
-  short: string;
-  content: string;
-  embedding: number[];
-}
-
-const ITEMS: SampleItem[] = [
-  {
-    id: 0,
-    type: "text",
-    label: "The cat sat on the mat",
-    short: "Cat T",
-    content: "The cat sat on the mat",
-    embedding: mixAndNormalize(
-      [
-        { dir: D_ANIMAL, weight: 1.0 },
-        { dir: D_DOMESTIC, weight: 0.7 },
-      ],
-      1001,
-    ),
-  },
-  {
-    id: 1,
-    type: "text",
-    label: "A dog played in the park",
-    short: "Dog T",
-    content: "A dog played in the park",
-    embedding: mixAndNormalize(
-      [
-        { dir: D_ANIMAL, weight: 0.9 },
-        { dir: D_NATURE, weight: 0.6 },
-      ],
-      1002,
-    ),
-  },
-  {
-    id: 2,
-    type: "text",
-    label: "The stock market rose sharply",
-    short: "Stk T",
-    content: "The stock market rose sharply",
-    embedding: mixAndNormalize([{ dir: D_FINANCE, weight: 1.0 }], 1003),
-  },
-  {
-    id: 3,
-    type: "text",
-    label: "She drove her car to work",
-    short: "Car T",
-    content: "She drove her car to work",
-    embedding: mixAndNormalize([{ dir: D_VEHICLE, weight: 1.0 }], 1004),
-  },
-  {
-    id: 4,
-    type: "image",
-    label: "Cat",
-    short: "Cat I",
-    content: "cat",
-    embedding: mixAndNormalize(
-      [
-        { dir: D_ANIMAL, weight: 1.0 },
-        { dir: D_DOMESTIC, weight: 0.6 },
-      ],
-      2001,
-    ),
-  },
-  {
-    id: 5,
-    type: "image",
-    label: "Dog",
-    short: "Dog I",
-    content: "dog",
-    embedding: mixAndNormalize(
-      [
-        { dir: D_ANIMAL, weight: 0.8 },
-        { dir: D_NATURE, weight: 0.7 },
-      ],
-      2002,
-    ),
-  },
-  {
-    id: 6,
-    type: "image",
-    label: "Tree",
-    short: "Tree I",
-    content: "tree",
-    embedding: mixAndNormalize([{ dir: D_NATURE, weight: 1.0 }], 2003),
-  },
-  {
-    id: 7,
-    type: "image",
-    label: "Car",
-    short: "Car I",
-    content: "car",
-    embedding: mixAndNormalize([{ dir: D_VEHICLE, weight: 1.0 }], 2004),
-  },
-];
-
-// ─── Inline SVG Images ────────────────────────────────────
-
-function CatSvg({ size = 56 }: { size?: number }) {
-  return (
-    <svg viewBox="0 0 80 80" width={size} height={size}>
-      <polygon points="18,32 26,8 34,32" fill="#FF9800" />
-      <polygon points="46,32 54,8 62,32" fill="#FF9800" />
-      <polygon points="21,32 26,15 31,32" fill="#FFE0B2" />
-      <polygon points="49,32 54,15 59,32" fill="#FFE0B2" />
-      <ellipse cx={40} cy={48} rx={26} ry={24} fill="#FFB74D" />
-      <ellipse cx={30} cy={42} rx={4} ry={4.5} fill="#FFF" />
-      <circle cx={31} cy={42} r={2.5} fill="#333" />
-      <ellipse cx={50} cy={42} rx={4} ry={4.5} fill="#FFF" />
-      <circle cx={51} cy={42} r={2.5} fill="#333" />
-      <polygon points="40,50 37,54 43,54" fill="#E91E63" />
-      <path
-        d="M37,54 Q40,58 43,54"
-        fill="none"
-        stroke="#333"
-        strokeWidth={1.2}
-      />
-      <line x1={8} y1={48} x2={28} y2={50} stroke="#333" strokeWidth={1} />
-      <line x1={8} y1={54} x2={28} y2={53} stroke="#333" strokeWidth={1} />
-      <line x1={52} y1={50} x2={72} y2={48} stroke="#333" strokeWidth={1} />
-      <line x1={52} y1={53} x2={72} y2={54} stroke="#333" strokeWidth={1} />
-    </svg>
-  );
-}
-
-function DogSvg({ size = 56 }: { size?: number }) {
-  return (
-    <svg viewBox="0 0 80 80" width={size} height={size}>
-      <ellipse
-        cx={16}
-        cy={38}
-        rx={11}
-        ry={18}
-        fill="#795548"
-        transform="rotate(-10 16 38)"
-      />
-      <ellipse
-        cx={64}
-        cy={38}
-        rx={11}
-        ry={18}
-        fill="#795548"
-        transform="rotate(10 64 38)"
-      />
-      <ellipse cx={40} cy={45} rx={24} ry={22} fill="#A1887F" />
-      <ellipse cx={31} cy={40} rx={4} ry={4.5} fill="#FFF" />
-      <circle cx={32} cy={40} r={2.5} fill="#333" />
-      <ellipse cx={49} cy={40} rx={4} ry={4.5} fill="#FFF" />
-      <circle cx={50} cy={40} r={2.5} fill="#333" />
-      <ellipse cx={40} cy={52} rx={12} ry={8} fill="#D7CCC8" />
-      <ellipse cx={40} cy={49} rx={4} ry={3} fill="#333" />
-      <path
-        d="M36,53 Q40,58 44,53"
-        fill="none"
-        stroke="#333"
-        strokeWidth={1.2}
-      />
-      <ellipse cx={40} cy={58} rx={4} ry={5} fill="#E91E63" />
-    </svg>
-  );
-}
-
-function TreeSvg({ size = 56 }: { size?: number }) {
-  return (
-    <svg viewBox="0 0 80 80" width={size} height={size}>
-      <rect x={34} y={52} width={12} height={22} rx={2} fill="#795548" />
-      <circle cx={40} cy={32} r={20} fill="#43A047" />
-      <circle cx={28} cy={40} r={14} fill="#66BB6A" />
-      <circle cx={52} cy={40} r={14} fill="#66BB6A" />
-      <circle cx={40} cy={22} r={14} fill="#2E7D32" />
-      <circle cx={35} cy={26} r={5} fill="#81C784" opacity={0.6} />
-    </svg>
-  );
-}
-
-function CarSvg({ size = 56 }: { size?: number }) {
-  return (
-    <svg viewBox="0 0 80 80" width={size} height={size}>
-      <rect x={6} y={38} width={68} height={18} rx={4} fill="#1976D2" />
-      <path d="M20,38 L28,22 L56,22 L64,38" fill="#1565C0" />
-      <path
-        d="M24,37 L30,24 L41,24 L41,37"
-        fill="#BBDEFB"
-        opacity={0.8}
-      />
-      <path
-        d="M43,37 L43,24 L54,24 L60,37"
-        fill="#BBDEFB"
-        opacity={0.8}
-      />
-      <rect x={67} y={42} width={7} height={5} rx={2} fill="#FFF9C4" />
-      <rect x={6} y={42} width={5} height={5} rx={2} fill="#EF5350" />
-      <circle cx={22} cy={58} r={8} fill="#424242" />
-      <circle cx={22} cy={58} r={4.5} fill="#757575" />
-      <circle cx={58} cy={58} r={8} fill="#424242" />
-      <circle cx={58} cy={58} r={4.5} fill="#757575" />
-      <rect x={8} y={55} width={64} height={2.5} rx={1} fill="#0D47A1" />
-    </svg>
-  );
-}
-
-function ItemImage({
-  content,
-  size = 56,
-}: {
-  content: string;
-  size?: number;
-}) {
-  switch (content) {
-    case "cat":
-      return <CatSvg size={size} />;
-    case "dog":
-      return <DogSvg size={size} />;
-    case "tree":
-      return <TreeSvg size={size} />;
-    case "car":
-      return <CarSvg size={size} />;
-    default:
-      return null;
+function euclideanDist(a: number[], b: number[]): number {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = a[i]! - b[i]!;
+    sum += d * d;
   }
+  return Math.sqrt(sum);
 }
 
-// ─── Sub-components ───────────────────────────────────────
+// ─── Scatter Chart (hand-rolled SVG) ────────────────────────
 
-function DimensionBars({ values }: { values: number[] }) {
+function ScatterChart({
+  sentences,
+  points,
+  selectedIds,
+  onToggle,
+}: {
+  sentences: Sentence[];
+  points: { x: number; y: number }[];
+  selectedIds: number[];
+  onToggle: (id: number) => void;
+}) {
   const theme = useTheme();
-  const maxAbs = Math.max(...values.map(Math.abs), 0.001);
-  const barH = 15;
-  const gap = 5;
-  const h = values.length * (barH + gap);
-  const w = 360;
-  const lbl = 28;
-  const val = 58;
-  const area = w - lbl - val;
-  const mid = lbl + area / 2;
+  const grid = [-80, -60, -40, -20, 20, 40, 60, 80];
 
   return (
-    <svg
-      width="100%"
-      viewBox={`0 0 ${w} ${h}`}
-      style={{ display: "block", marginBottom: 8 }}
-    >
-      {values.map((v, i) => {
-        const y = i * (barH + gap);
-        const bw = (Math.abs(v) / maxAbs) * (area / 2 - 4);
-        const bx = v >= 0 ? mid : mid - bw;
-        const color = v >= 0 ? "#1976D2" : "#F44336";
+    <svg viewBox="-110 -110 220 220" width="100%" style={{ display: "block", maxHeight: 460 }}>
+      {grid.map((g) => (
+        <g key={g}>
+          <line x1={g} y1={-100} x2={g} y2={100} stroke={theme.palette.divider} strokeWidth={0.5} />
+          <line x1={-100} y1={g} x2={100} y2={g} stroke={theme.palette.divider} strokeWidth={0.5} />
+        </g>
+      ))}
+      <line x1={-100} y1={0} x2={100} y2={0} stroke={theme.palette.text.disabled} strokeWidth={1} />
+      <line x1={0} y1={-100} x2={0} y2={100} stroke={theme.palette.text.disabled} strokeWidth={1} />
+      <text x={-102} y={-104} fill={theme.palette.text.secondary} fontSize={7}>PC1 →</text>
+      <text x={-102} y={-94} fill={theme.palette.text.secondary} fontSize={7}>PC2 ↓</text>
+      {sentences.map((s, i) => {
+        const p = points[i] ?? { x: 0, y: 0 };
+        const selected = selectedIds.includes(s.id);
         return (
-          <g key={i}>
-            <text
-              x={lbl - 3}
-              y={y + barH / 2 + 1}
-              textAnchor="end"
-              dominantBaseline="central"
-              fill={theme.palette.text.secondary}
-              fontSize={8}
-            >
-              [{i}]
-            </text>
-            <rect
-              x={bx}
-              y={y + 1}
-              width={Math.max(1, bw)}
-              height={barH - 2}
-              rx={2}
-              fill={color}
-              opacity={0.6}
-            />
-            <line
-              x1={mid}
-              y1={y}
-              x2={mid}
-              y2={y + barH}
-              stroke={theme.palette.divider}
-              strokeWidth={0.5}
+          <g
+            key={s.id}
+            onClick={() => onToggle(s.id)}
+            style={{ cursor: "pointer" }}
+          >
+            <title>{s.text}</title>
+            {selected && (
+              <circle
+                cx={p.x}
+                cy={p.y}
+                r={13}
+                fill="none"
+                stroke={theme.palette.text.primary}
+                strokeWidth={1.5}
+                strokeDasharray="4 2"
+              />
+            )}
+            <circle
+              cx={p.x}
+              cy={p.y}
+              r={10}
+              fill={s.color}
+              opacity={selected || selectedIds.length === 0 ? 0.95 : 0.55}
+              stroke={theme.palette.background.paper}
+              strokeWidth={2}
             />
             <text
-              x={w}
-              y={y + barH / 2 + 1}
-              textAnchor="end"
-              dominantBaseline="central"
-              fill={theme.palette.text.primary}
-              fontSize={8}
-              fontFamily="monospace"
+              x={p.x}
+              y={p.y + 3.5}
+              fill="#fff"
+              fontSize={9}
+              fontWeight={700}
+              textAnchor="middle"
+              pointerEvents="none"
             >
-              {v >= 0 ? "\u00A0" : ""}
-              {v.toFixed(4)}
+              {i + 1}
             </text>
           </g>
         );
@@ -378,87 +224,149 @@ function DimensionBars({ values }: { values: number[] }) {
   );
 }
 
-// ─── Main Component ───────────────────────────────────────
+// ─── Main Component ─────────────────────────────────────────
 
 export function VectorEmbeddings() {
-  const [embedded, setEmbedded] = useState<Set<number>>(() => new Set());
-  const [embedding, setEmbedding] = useState<number | null>(null);
-  const [selected, setSelected] = useState<number | null>(null);
-  const [compareA, setCompareA] = useState<number | "">("");
-  const [compareB, setCompareB] = useState<number | "">("");
+  const nextId = useRef(DEFAULT_SENTENCES.length);
+  const [sentences, setSentences] = useState<Sentence[]>(() =>
+    DEFAULT_SENTENCES.map((text, i) => ({
+      id: i,
+      text,
+      color: COLORS[i % COLORS.length]!,
+      // Optimistic: bundled nomic vectors render instantly; corrected once
+      // the model list loads if nomic isn't the resolved model.
+      embedding: CACHED_NOMIC_EMBEDDINGS[text] ?? null,
+    })),
+  );
+  const [input, setInput] = useState("");
+  const [models, setModels] = useState<OllamaModel[]>([]);
+  const [model, setModel] = useState("");
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+  const [embedError, setEmbedError] = useState<string | null>(null);
+  const [isEmbedding, setIsEmbedding] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
 
-  const embeddedItems = useMemo(
-    () => ITEMS.filter((item) => embedded.has(item.id)),
+  // Load embedding-capable models, default to the smallest one.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/ollama/tags");
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.error ?? "Failed to list models.");
+        const all: OllamaModel[] = data.models ?? [];
+        const capable = all.filter((m) => (m.capabilities ?? []).includes("embedding"));
+        const pool = capable.length > 0 ? capable : all;
+        // Prefer nomic when available, otherwise fall back to the smallest model.
+        const nomic = pool.find((m) => isNomicModel(m.name));
+        const smallest = [...pool].sort(
+          (a, b) =>
+            parameterCount(a.details?.parameter_size) -
+            parameterCount(b.details?.parameter_size),
+        )[0];
+        const resolved = nomic ?? smallest;
+        if (!cancelled) {
+          setModels(pool);
+          setModel(resolved?.name ?? "");
+          if (capable.length === 0 && all.length > 0) {
+            setModelsError("No embedding-capable model found. Try `ollama pull nomic-embed-text`.");
+          }
+          // Drop the optimistic bundled vectors if the resolved model isn't nomic.
+          if (resolved && !isNomicModel(resolved.name)) {
+            setSentences((prev) => prev.map((s) => ({ ...s, embedding: null })));
+          }
+        }
+      } catch (e) {
+        if (!cancelled)
+          setModelsError(e instanceof Error ? e.message : "Could not reach Ollama.");
+      } finally {
+        if (!cancelled) setModelsLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Embed any sentences missing vectors (debounced, single batched request).
+  useEffect(() => {
+    if (!model) return;
+    const missing = sentences.filter((s) => s.embedding === null);
+    if (missing.length === 0) return;
+    const timer = setTimeout(async () => {
+      setIsEmbedding(true);
+      setEmbedError(null);
+      try {
+        const res = await fetch("/api/ollama/embed", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model, inputs: missing.map((s) => s.text) }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.error ?? "Embedding failed.");
+        const vectors: number[][] = data.embeddings ?? [];
+        setSentences((prev) =>
+          prev.map((s) => {
+            const idx = missing.findIndex((m) => m.id === s.id);
+            return idx >= 0 && vectors[idx] ? { ...s, embedding: vectors[idx]! } : s;
+          }),
+        );
+      } catch (e) {
+        setEmbedError(e instanceof Error ? e.message : "Embedding failed.");
+      } finally {
+        setIsEmbedding(false);
+      }
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [model, sentences]);
+
+  const handleAdd = useCallback(() => {
+    const text = input.trim();
+    if (!text) return;
+    setSentences((prev) => {
+      if (prev.length >= MAX_SENTENCES) return prev;
+      const used = new Set(prev.map((s) => s.color));
+      const color = COLORS.find((c) => !used.has(c)) ?? COLORS[prev.length % COLORS.length]!;
+      return [...prev, { id: nextId.current++, text, color, embedding: cachedEmbeddingFor(text, model) }];
+    });
+    setInput("");
+  }, [input, model]);
+
+  const handleRemove = useCallback((id: number) => {
+    setSentences((prev) => prev.filter((s) => s.id !== id));
+    setSelectedIds((prev) => prev.filter((sid) => sid !== id));
+  }, []);
+
+  const handleTogglePoint = useCallback((id: number) => {
+    setSelectedIds((prev) =>
+      prev.includes(id) ? prev.filter((sid) => sid !== id) : [...prev, id].slice(-2),
+    );
+  }, []);
+
+  const embedded = useMemo(() => sentences.filter((s) => s.embedding !== null), [sentences]);
+
+  const points = useMemo(
+    () => pca2D(embedded.map((s) => s.embedding!)),
     [embedded],
   );
 
-  const compareAId =
-    typeof compareA === "number" && embedded.has(compareA)
-      ? compareA
-      : (embeddedItems[0]?.id ?? null);
-  const compareBCandidate =
-    typeof compareB === "number" && embedded.has(compareB)
-      ? compareB
-      : (embeddedItems.find((i) => i.id !== compareAId)?.id ?? null);
-  const compareBId =
-    compareBCandidate !== null && compareBCandidate === compareAId
-      ? (embeddedItems.find((i) => i.id !== compareAId)?.id ?? null)
-      : compareBCandidate;
-  const compareAItem =
-    compareAId !== null ? (ITEMS.find((i) => i.id === compareAId) ?? null) : null;
-  const compareBItem =
-    compareBId !== null ? (ITEMS.find((i) => i.id === compareBId) ?? null) : null;
-  const pairSimilarity =
-    compareAItem && compareBItem && compareAItem.id !== compareBItem.id
-      ? cosineSim(compareAItem.embedding, compareBItem.embedding)
-      : null;
+  const similarities = useMemo(() => {
+    const pair = selectedIds
+      .map((id) => embedded.find((s) => s.id === id) ?? null)
+      .filter((s): s is Sentence => s !== null && s.embedding !== null);
+    if (pair.length !== 2) return null;
+    const [a, b] = pair as [Sentence, Sentence];
+    return {
+      a,
+      b,
+      cosine: cosineSim(a.embedding!, b.embedding!),
+      euclidean: euclideanDist(a.embedding!, b.embedding!),
+    };
+  }, [embedded, selectedIds]);
 
-  const handleEmbed = useCallback(
-    (id: number) => {
-      if (embedding !== null) return;
-
-      if (embedded.has(id)) {
-        setEmbedded((prev) => {
-          const next = new Set(prev);
-          next.delete(id);
-          return next;
-        });
-        setSelected((prev) => (prev === id ? null : prev));
-        if (compareA === id) setCompareA("");
-        if (compareB === id) setCompareB("");
-        return;
-      }
-
-      setEmbedding(id);
-      setSelected(id);
-      setTimeout(() => {
-        setEmbedded((prev) => new Set([...prev, id]));
-        setEmbedding(null);
-      }, 600);
-    },
-    [embedded, embedding, compareA, compareB],
-  );
-
-  const handleEmbedAll = useCallback(() => {
-    if (embedding !== null) return;
-    setEmbedding(-1);
-    setTimeout(() => {
-      setEmbedded(new Set(ITEMS.map((i) => i.id)));
-      setEmbedding(null);
-      setSelected((prev) => prev ?? 0);
-    }, 800);
-  }, [embedding]);
-
-  const handleReset = useCallback(() => {
-    setEmbedded(new Set());
-    setEmbedding(null);
-    setSelected(null);
-    setCompareA("");
-    setCompareB("");
-  }, []);
-
-  const selectedItem =
-    selected !== null ? (ITEMS.find((i) => i.id === selected) ?? null) : null;
+  const error = modelsError ?? embedError;
+  const dimCount = embedded[0]?.embedding?.length ?? 0;
 
   return (
     <Box sx={{ pt: 2, pb: 1, px: 1 }}>
@@ -466,333 +374,209 @@ export function VectorEmbeddings() {
         Vector Embeddings
       </Typography>
       <Typography variant="body1" color="text.secondary" sx={{ mb: 1.5 }}>
-        AI converts text and images into <strong>vectors</strong> — lists of
-        numbers that capture meaning. Similar concepts produce similar vectors,
-        enabling AI to understand relationships between words, sentences, and
-        images.
+        AI converts text into <strong>vectors</strong> — lists of numbers that
+        capture meaning. Below, real embeddings from Ollama are projected down
+        to 2D. Semantically similar sentences land close together.
       </Typography>
 
-      <Box sx={{ display: "flex", gap: 2, alignItems: "stretch" }}>
-        {/* ── Left Panel: Sample Items ── */}
-        <Paper
-          elevation={2}
-          sx={{ p: 2, borderRadius: 3, flex: "0 0 210px" }}
+      {error && (
+        <Alert
+          severity="error"
+          sx={{ mb: 2 }}
+          onClose={() => {
+            setModelsError(null);
+            setEmbedError(null);
+          }}
         >
-          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
-            Sample Texts
-          </Typography>
-          <Divider sx={{ mb: 1 }} />
-          <Stack spacing={0.5} sx={{ mb: 1.5 }}>
-            {ITEMS.filter((i) => i.type === "text").map((item) => (
-              <Box
-                key={item.id}
-                onClick={() => handleEmbed(item.id)}
-                sx={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 0.5,
-                  p: 0.75,
-                  borderRadius: 1.5,
-                  cursor: "pointer",
-                  border: 2,
-                  borderColor:
-                    selected === item.id
-                      ? "primary.main"
-                      : embedded.has(item.id)
-                        ? "primary.light"
-                        : "divider",
-                  bgcolor:
-                    selected === item.id ? "action.selected" : "transparent",
-                  "&:hover": { bgcolor: "action.hover" },
-                }}
-              >
-                {embedding === item.id ||
-                (embedding === -1 && !embedded.has(item.id)) ? (
-                  <CircularProgress size={14} sx={{ flexShrink: 0 }} />
-                ) : embedded.has(item.id) ? (
-                  <CheckCircleRoundedIcon
-                    sx={{ fontSize: 16, color: "primary.main", flexShrink: 0 }}
-                  />
-                ) : (
-                  <Box sx={{ width: 16, flexShrink: 0 }} />
-                )}
-                <Typography
-                  variant="caption"
-                  sx={{
-                    fontStyle: "italic",
-                    lineHeight: 1.3,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    display: "-webkit-box",
-                    WebkitLineClamp: 2,
-                    WebkitBoxOrient: "vertical",
-                  }}
-                >
-                  &ldquo;{item.content}&rdquo;
-                </Typography>
-              </Box>
-            ))}
-          </Stack>
+          {error}{" "}
+          {error.includes("11434") && "Is `ollama serve` running?"}
+        </Alert>
+      )}
 
-          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
-            Sample Images
-          </Typography>
-          <Divider sx={{ mb: 1 }} />
-          <Box
-            sx={{
-              display: "grid",
-              gridTemplateColumns: "1fr 1fr",
-              gap: 1,
-              mb: 1.5,
-            }}
-          >
-            {ITEMS.filter((i) => i.type === "image").map((item) => (
-              <Paper
-                key={item.id}
-                elevation={selected === item.id ? 3 : 0}
-                onClick={() => handleEmbed(item.id)}
-                sx={{
-                  p: 0.75,
-                  borderRadius: 2,
-                  cursor: "pointer",
-                  textAlign: "center",
-                  border: 2,
-                  borderColor:
-                    selected === item.id
-                      ? "primary.main"
-                      : embedded.has(item.id)
-                        ? "primary.light"
-                        : "divider",
-                  bgcolor:
-                    selected === item.id ? "action.selected" : "transparent",
-                  "&:hover": { bgcolor: "action.hover" },
-                  position: "relative",
-                }}
-              >
-                {(embedding === item.id ||
-                  (embedding === -1 && !embedded.has(item.id))) && (
-                  <CircularProgress
-                    size={16}
-                    sx={{ position: "absolute", top: 4, right: 4 }}
-                  />
-                )}
-                {embedded.has(item.id) && embedding !== item.id && (
-                  <CheckCircleRoundedIcon
-                    sx={{
-                      position: "absolute",
-                      top: 4,
-                      right: 4,
-                      fontSize: 16,
-                      color: "primary.main",
-                    }}
-                  />
-                )}
-                <ItemImage content={item.content} size={48} />
-                <Typography variant="caption" display="block">
-                  {item.label}
-                </Typography>
-              </Paper>
-            ))}
-          </Box>
-
-          <Stack spacing={1}>
-            <Button
-              variant="contained"
-              size="small"
-              fullWidth
-              onClick={handleEmbedAll}
-              disabled={embedded.size === ITEMS.length || embedding !== null}
-            >
-              Embed All
-            </Button>
-            <Button
-              variant="outlined"
-              size="small"
-              fullWidth
-              startIcon={<RestartAltRoundedIcon />}
-              onClick={handleReset}
-            >
-              Reset
-            </Button>
-          </Stack>
-        </Paper>
-
-        {/* ── Center Panel: Embedding Display ── */}
-        <Paper elevation={2} sx={{ p: 2, borderRadius: 3, flex: 1 }}>
-          {selectedItem && embedded.has(selectedItem.id) ? (
-            <>
-              <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
-                Embedding: {selectedItem.label}
-                {selectedItem.type === "image" ? " (image)" : ""}
-              </Typography>
-              {selectedItem.type === "image" ? (
-                <Box sx={{ mb: 1.5 }}>
-                  <ItemImage content={selectedItem.content} size={64} />
-                </Box>
-              ) : (
-                <Typography
-                  variant="body2"
-                  color="text.secondary"
-                  sx={{ mb: 1.5, fontStyle: "italic" }}
-                >
-                  &ldquo;{selectedItem.content}&rdquo;
-                </Typography>
-              )}
-              <Typography variant="subtitle2" fontWeight="bold" gutterBottom>
-                Vector ({DIMS} dimensions)
-              </Typography>
-              <DimensionBars
-                values={selectedItem.embedding.slice(0, SHOW_DIMS)}
-              />
-              <Typography
-                variant="caption"
-                color="text.secondary"
-                sx={{ display: "block", mb: 1 }}
-              >
-                Showing {SHOW_DIMS} of {DIMS} dimensions
-              </Typography>
-              <Typography
-                variant="caption"
-                component="pre"
-                sx={{
-                  fontFamily: "monospace",
-                  fontSize: 10,
-                  color: "text.secondary",
-                  bgcolor: "action.hover",
-                  p: 1,
-                  borderRadius: 1,
-                  overflowX: "auto",
-                  whiteSpace: "pre-wrap",
-                  wordBreak: "break-all",
-                }}
-              >
-                [
-                {selectedItem.embedding
-                  .slice(0, SHOW_DIMS)
-                  .map((v) => v.toFixed(4))
-                  .join(", ")}
-                , ...{DIMS - SHOW_DIMS} more]
-              </Typography>
-            </>
-          ) : embedding !== null ? (
-            <Box
-              sx={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                height: "100%",
-                minHeight: 200,
+      <Box sx={{ display: "flex", gap: 2, alignItems: "stretch", flexWrap: "wrap" }}>
+        {/* ── Left: sentence list ── */}
+        <Paper elevation={2} sx={{ p: 2, borderRadius: 3, flex: "1 1 280px" }}>
+          <FormControl size="small" fullWidth sx={{ mb: 1.5 }}>
+            <InputLabel id="embed-model-label">Embedding model</InputLabel>
+            <Select
+              labelId="embed-model-label"
+              label="Embedding model"
+              value={model}
+              onChange={(e) => {
+                const next = e.target.value;
+                setModel(next);
+                // Regenerate vectors for the new model, reusing bundled
+                // vectors when switching (back) to nomic.
+                setSentences((prev) =>
+                  prev.map((s) => ({ ...s, embedding: cachedEmbeddingFor(s.text, next) })),
+                );
               }}
+              disabled={modelsLoading || models.length === 0}
             >
-              <Stack alignItems="center" spacing={1}>
-                <CircularProgress />
-                <Typography variant="body2" color="text.secondary">
-                  Generating embedding...
-                </Typography>
-              </Stack>
-            </Box>
-          ) : (
-            <Box
-              sx={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                height: "100%",
-                minHeight: 200,
-              }}
-            >
-              <Typography
-                variant="body2"
-                color="text.secondary"
-                textAlign="center"
-              >
-                Click a sample text or image to embed it.
-                <br />
-                Click an embedded item again to deselect it.
-                <br />
-                The embedding vector will appear here.
+              {models.map((m) => (
+                <MenuItem key={m.name} value={m.name}>
+                  {m.name}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          {modelsLoading && (
+            <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1.5 }}>
+              <CircularProgress size={16} />
+              <Typography variant="body2" color="text.secondary">
+                Loading models from Ollama…
               </Typography>
             </Box>
           )}
+          {dimCount > 0 && (
+            <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+              {dimCount}-dim vectors → 2D via PCA
+            </Typography>
+          )}
+          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
+            Sentences ({sentences.length}/{MAX_SENTENCES})
+          </Typography>
+          <Divider sx={{ mb: 1.5 }} />
+          <Stack spacing={1} sx={{ mb: 1.5 }}>
+            {sentences.map((s, i) => (
+              <Paper
+                key={s.id}
+                variant="outlined"
+                sx={{ p: 1, borderRadius: 2, border: 2, borderColor: s.color }}
+              >
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+                  <Box
+                    sx={{
+                      width: 22,
+                      height: 22,
+                      borderRadius: "50%",
+                      bgcolor: s.color,
+                      color: "#fff",
+                      fontSize: 12,
+                      fontWeight: 700,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      flexShrink: 0,
+                    }}
+                  >
+                    {i + 1}
+                  </Box>
+                  <Box sx={{ flex: 1, minWidth: 0 }}>
+                    <Typography variant="body2" sx={{ lineHeight: 1.4 }}>
+                      {s.text}
+                    </Typography>
+                    {s.embedding === null && (
+                      <Typography variant="caption" color="text.secondary">
+                        embedding…
+                      </Typography>
+                    )}
+                  </Box>
+                  <Tooltip title="Remove">
+                    <span>
+                      <IconButton
+                        size="small"
+                        onClick={() => handleRemove(s.id)}
+                        disabled={sentences.length <= 1}
+                      >
+                        <DeleteRoundedIcon fontSize="small" />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                </Box>
+              </Paper>
+            ))}
+          </Stack>
+          <Box sx={{ display: "flex", gap: 1 }}>
+            <TextField
+              label={sentences.length >= MAX_SENTENCES ? `Max ${MAX_SENTENCES} sentences` : "Add a sentence"}
+              size="small"
+              fullWidth
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleAdd();
+              }}
+              disabled={sentences.length >= MAX_SENTENCES}
+            />
+            <Button
+              variant="contained"
+              onClick={handleAdd}
+              disabled={sentences.length >= MAX_SENTENCES || input.trim() === ""}
+              sx={{ flexShrink: 0 }}
+            >
+              <AddRoundedIcon />
+            </Button>
+          </Box>
         </Paper>
 
-        {/* ── Right Panel: Similarity ── */}
-        <Paper
-          elevation={2}
-          sx={{ p: 2, borderRadius: 3, minWidth: 180 }}
-        >
+        {/* ── Right: 2D chart ── */}
+        <Paper elevation={2} sx={{ p: 2, borderRadius: 3, flex: "2 1 340px" }}>
           <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
-            Similarity
+            Semantic map (2D projection)
           </Typography>
-          <Divider sx={{ mb: 1 }} />
-          {embeddedItems.length >= 2 ? (
-            <Stack spacing={1.25}>
-              <FormControl size="small" fullWidth>
-                <InputLabel id="similarity-item-a-label">Item A</InputLabel>
-                <Select
-                  labelId="similarity-item-a-label"
-                  label="Item A"
-                  value={compareAId ?? ""}
-                  onChange={(e) => {
-                    const val = Number(e.target.value);
-                    setCompareA(Number.isNaN(val) ? "" : val);
-                  }}
-                >
-                  {embeddedItems.map((item) => (
-                    <MenuItem key={`a-${item.id}`} value={item.id}>
-                      {item.short}
-                    </MenuItem>
-                  ))}
-                </Select>
-              </FormControl>
-
-              <FormControl size="small" fullWidth>
-                <InputLabel id="similarity-item-b-label">Item B</InputLabel>
-                <Select
-                  labelId="similarity-item-b-label"
-                  label="Item B"
-                  value={compareBId ?? ""}
-                  onChange={(e) => {
-                    const val = Number(e.target.value);
-                    setCompareB(Number.isNaN(val) ? "" : val);
-                  }}
-                >
-                  {embeddedItems
-                    .filter((item) => item.id !== compareAId)
-                    .map((item) => (
-                      <MenuItem key={`b-${item.id}`} value={item.id}>
-                        {item.short}
-                      </MenuItem>
-                    ))}
-                </Select>
-              </FormControl>
-
-              {pairSimilarity !== null ? (
-                <Box
-                  sx={{
-                    mt: 0.5,
-                    p: 1.25,
-                    borderRadius: 1.5,
-                    bgcolor: "action.hover",
-                  }}
-                >
-                  <Typography variant="body2" color="text.secondary">
-                    {compareAItem?.short} ↔ {compareBItem?.short}
+          <Divider sx={{ mb: 1.5 }} />
+          {isEmbedding && embedded.length === 0 ? (
+            <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: 300 }}>
+              <Stack alignItems="center" spacing={1}>
+                <CircularProgress />
+                <Typography variant="body2" color="text.secondary">
+                  Generating embeddings with {model || "Ollama"}…
+                </Typography>
+              </Stack>
+            </Box>
+          ) : embedded.length === 0 ? (
+            <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: 300 }}>
+              <Typography variant="body2" color="text.secondary" textAlign="center">
+                Add a sentence to see it on the map.
+              </Typography>
+            </Box>
+          ) : (
+            <>
+              <ScatterChart
+                sentences={embedded}
+                points={points}
+                selectedIds={selectedIds}
+                onToggle={handleTogglePoint}
+              />
+              <Divider sx={{ my: 1.5 }} />
+              {similarities ? (
+                <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: "action.hover" }}>
+                  <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "center", mb: 0.5 }}>
+                    <Typography variant="subtitle2" fontWeight="bold">
+                      <Box component="span" sx={{ color: similarities.a.color }}>●</Box>{" "}
+                      #{embedded.findIndex((s) => s.id === similarities.a.id) + 1}
+                      {"  ↔  "}
+                      <Box component="span" sx={{ color: similarities.b.color }}>●</Box>{" "}
+                      #{embedded.findIndex((s) => s.id === similarities.b.id) + 1}
+                    </Typography>
+                    <Button size="small" onClick={() => setSelectedIds([])}>
+                      Clear
+                    </Button>
+                  </Box>
+                  <Typography variant="body2" color="text.secondary" sx={{ mb: 0.5 }}>
+                    &ldquo;{similarities.a.text}&rdquo; vs &ldquo;{similarities.b.text}&rdquo;
                   </Typography>
-                  <Typography variant="h5" fontWeight="bold">
-                    {pairSimilarity.toFixed(4)}
+                  <Typography variant="body2">
+                    Cosine similarity: <strong>{similarities.cosine.toFixed(4)}</strong>
+                    {"  ·  "}
+                    Euclidean distance: <strong>{similarities.euclidean.toFixed(4)}</strong>
                   </Typography>
                 </Box>
               ) : (
-                <Typography variant="body2" color="text.secondary">
-                  Select two different embedded items.
+                <Typography variant="body2" color="text.secondary" textAlign="center">
+                  {selectedIds.length === 1
+                    ? "One point selected — click a second point to compare."
+                    : "Click two points on the map to compare their similarity."}
                 </Typography>
               )}
-            </Stack>
-          ) : (
-            <Typography variant="body2" color="text.secondary">
-              Embed 2+ items to compare their similarity.
-            </Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+                Positions are relative — PCA recomputes each time the set changes, so
+                points shift when you add or remove sentences. Watch the cat
+                sentences cluster apart from the quantum one.
+                {isEmbedding && " Updating…"}
+              </Typography>
+            </>
           )}
         </Paper>
       </Box>

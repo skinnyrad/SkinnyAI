@@ -349,6 +349,12 @@ export function TextGeneration() {
       <Typography variant="h5" fontWeight="bold" gutterBottom>
         Next-Token Prediction
       </Typography>
+      <Typography variant="body1" color="text.secondary" sx={{ mb: 1.5 }}>
+        LLMs generate text <strong>one token at a time</strong> — each step, the
+        model scores every possible next token, turns those scores into
+        probabilities, and samples one. Adjust the controls to see how
+        temperature and top-K reshape the odds before each pick.
+      </Typography>
 
       {(modelsError || error) && (
         <Alert severity="error" sx={{ mb: 2 }} onClose={() => {
