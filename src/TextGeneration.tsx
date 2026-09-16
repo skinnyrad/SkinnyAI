@@ -1,543 +1,534 @@
-import { useState, useMemo, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import {
   Box,
   Typography,
   Paper,
-  Chip,
   Divider,
   Button,
-  IconButton,
-  useTheme,
+  TextField,
+  Slider,
+  Select,
+  MenuItem,
+  FormControl,
+  InputLabel,
+  Alert,
   Stack,
+  IconButton,
+  Tooltip,
+  CircularProgress,
+  useTheme,
 } from "@mui/material";
 import PlayArrowRoundedIcon from "@mui/icons-material/PlayArrowRounded";
-import StopRoundedIcon from "@mui/icons-material/StopRounded";
-import RestartAltRoundedIcon from "@mui/icons-material/RestartAltRounded";
-import SkipNextRoundedIcon from "@mui/icons-material/SkipNextRounded";
-import NavigateNextRoundedIcon from "@mui/icons-material/NavigateNextRounded";
-import NavigateBeforeRoundedIcon from "@mui/icons-material/NavigateBeforeRounded";
+import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
+import CasinoRoundedIcon from "@mui/icons-material/CasinoRounded";
+import ClearRoundedIcon from "@mui/icons-material/ClearRounded";
 
-// ─── Vocabulary & Training Data ───────────────────────────
-
-const SENTENCES = [
-  ["the", "dog", "jumped", "over", "the", "fence"],
-  ["the", "cat", "sat", "on", "the", "mat"],
-  ["I", "like", "to", "eat", "good", "food"],
-  ["she", "went", "to", "the", "store"],
-];
-
-const VOCAB: string[] = [...new Set(SENTENCES.flat())].sort();
-const V = VOCAB.length;
-const W2I: Record<string, number> = Object.fromEntries(
-  VOCAB.map((w, i) => [w, i]),
-);
-
-// All consecutive word pairs from training data
-const BIGRAMS: [number, number][] = SENTENCES.flatMap((s) =>
-  s
-    .slice(0, -1)
-    .map((w, i) => [W2I[w]!, W2I[s[i + 1]!]!] as [number, number]),
-);
-
-const LEARNING_RATE = 0.1;
-const TOP_N = 7;
-
-// ─── Math Helpers ─────────────────────────────────────────
-
-function softmax(logits: number[]): number[] {
-  const max = Math.max(...logits);
-  const exps = logits.map((l) => Math.exp(l - max));
-  const sum = exps.reduce((a, b) => a + b, 0);
-  return exps.map((e) => e / sum);
-}
-
-function initWeights(): number[][] {
-  return Array.from({ length: V }, () =>
-    Array.from({ length: V }, () => (Math.random() - 0.5) * 0.2),
-  );
-}
-
-function trainEpoch(
-  weights: number[][],
-  lr: number,
-): { weights: number[][]; loss: number } {
-  const w = weights.map((row) => [...row]);
-  let totalLoss = 0;
-
-  for (const [inp, tgt] of BIGRAMS) {
-    const probs = softmax(w[inp]!);
-    totalLoss -= Math.log((probs[tgt] ?? 0) + 1e-10);
-    // Gradient: softmax output minus one-hot target
-    for (let j = 0; j < V; j++) {
-      w[inp]![j]! -= lr * ((probs[j] ?? 0) - (j === tgt ? 1 : 0));
-    }
-  }
-
-  return { weights: w, loss: totalLoss / BIGRAMS.length };
-}
-
-function weightColor(weight: number): string {
-  const intensity = Math.min(Math.abs(weight), 1);
-  const [tr, tg, tb] = weight >= 0 ? [25, 118, 210] : [244, 67, 54];
-  const r = Math.round(200 + (tr - 200) * intensity);
-  const g = Math.round(200 + (tg - 200) * intensity);
-  const b = Math.round(200 + (tb - 200) * intensity);
-  return `rgb(${r},${g},${b})`;
-}
-
-// ─── Types ────────────────────────────────────────────────
+// ─── Types ──────────────────────────────────────────────────
 
 interface Candidate {
-  wordIdx: number;
-  word: string;
+  token: string;
+  logprob: number;
   prob: number;
-  isTarget: boolean;
 }
 
-interface TrainState {
-  weights: number[][];
-  loss: number | null;
-  epoch: number;
-}
-
-// ─── SVG Diagram ──────────────────────────────────────────
-
-function BigramDiagram({
-  inputWord,
-  candidates,
-  inputWeights,
-}: {
-  inputWord: string;
+interface Step {
+  promptSnapshot: string;
+  chosenToken: string;
   candidates: Candidate[];
-  inputWeights: number[];
-}) {
-  const theme = useTheme();
-  const textColor = theme.palette.text.primary;
-  const labelColor = theme.palette.text.secondary;
-  const circleStroke = theme.palette.text.primary;
+  // Control values used for this step, so the adjusted view stays correct
+  // if the sliders move afterwards.
+  temperature: number;
+  topK: number;
+}
 
-  const width = 500;
-  const height = 360;
-  const inX = 90;
-  const inY = height / 2;
-  const outX = 340;
-  const n = candidates.length;
-  const outYs = candidates.map(
-    (_, i) => 40 + (i * (height - 80)) / Math.max(n - 1, 1),
+interface DisplayCandidate extends Candidate {
+  displayProb: number;
+  excluded: boolean;
+}
+
+// Number of candidates shown in the histogram (Ollama max is 20).
+const NUM_CANDIDATES = 10;
+
+// Make whitespace in tokens visible: " hello" -> "␣hello", "\n" -> "⏎".
+// The vocabulary also contains special control tokens (usually end-of-turn)
+// whose text decodes to nothing at all — Ollama reports those as "".
+function formatToken(token: string): string {
+  if (token === "") return "⟨control⟩";
+  return token
+    .replaceAll(" ", "␣")
+    .replaceAll("\n", "⏎")
+    .replaceAll("\t", "⇥");
+}
+
+// Derive display probabilities from the raw logprobs.
+//
+// Ollama returns pre-temperature logprobs l_i = logit_i − logsumexp(logits).
+// We reconstruct the distribution the sampler actually draws from:
+// softmax(logits / T) restricted to the top-K shortlist. Since
+// logit_i = l_i + LSE and the LSE/T constant cancels when renormalizing,
+// this is exactly proportional to exp(l_i / T) over the kept candidates.
+// T = 0 is greedy: 100% to the argmax.
+function computeDisplay(
+  candidates: Candidate[],
+  temperature: number,
+  topK: number,
+): DisplayCandidate[] {
+  const sorted = [...candidates].sort((a, b) => b.prob - a.prob);
+  if (temperature <= 0) {
+    return sorted.map((c, i) => ({
+      ...c,
+      displayProb: i === 0 ? 1 : 0,
+      excluded: false,
+    }));
+  }
+  // top_k <= 0 disables top-k filtering (full shortlist is eligible).
+  const filtering = topK > 0;
+  const weights = sorted.map((c, i) =>
+    !filtering || i < topK ? Math.exp(c.logprob / temperature) : 0,
   );
+  const sum = weights.reduce((a, b) => a + b, 0) || 1;
+  return sorted.map((c, i) => ({
+    ...c,
+    displayProb: weights[i]! / sum,
+    excluded: filtering && i >= topK,
+  }));
+}
+
+interface OllamaModel {
+  name: string;
+  model: string;
+  capabilities?: string[] | null;
+  details?: {
+    parameter_size?: string;
+  } | null;
+}
+
+// Parse sizes like "3.2B", "137M", "396.3B" into a comparable number.
+// Missing/unparseable sizes sort last.
+function parameterCount(size: string | undefined): number {
+  if (!size) return Number.POSITIVE_INFINITY;
+  const m = size.trim().match(/^([\d.]+)\s*([KMGT])?/i);
+  if (!m) return Number.POSITIVE_INFINITY;
+  const multipliers: Record<string, number> = {
+    K: 1e3,
+    M: 1e6,
+    G: 1e9,
+    B: 1e9,
+    T: 1e12,
+  };
+  const unit = (m[2] ?? "").toUpperCase();
+  return Number.parseFloat(m[1]!) * (multipliers[unit] ?? 1);
+}
+
+// ─── Histogram ──────────────────────────────────────────────
+
+function Histogram({ step }: { step: Step }) {
+  const theme = useTheme();
+  const rows = computeDisplay(
+    step.candidates,
+    step.temperature,
+    step.topK,
+  );
+  const maxProb = rows[0]?.displayProb ?? 1;
+
+  if (rows.length === 0) {
+    return (
+      <Typography variant="body2" color="text.secondary">
+        No candidates returned.
+      </Typography>
+    );
+  }
 
   return (
-    <svg
-      width="100%"
-      viewBox={`0 0 ${width} ${height}`}
-      style={{ overflow: "visible" }}
-    >
-      {/* Connection lines */}
-      {candidates.map((c, i) => (
-        <line
-          key={c.wordIdx}
-          x1={inX + 28}
-          y1={inY}
-          x2={outX - 22}
-          y2={outYs[i]!}
-          stroke={weightColor(inputWeights[c.wordIdx]!)}
-          strokeWidth={Math.max(1.5, c.prob * 8)}
-          opacity={0.6 + c.prob * 0.4}
-        />
-      ))}
-
-      {/* Weight labels on lines */}
-      {candidates.map((c, i) => {
-        const mx = (inX + 28 + outX - 22) / 2;
-        const my = (inY + outYs[i]!) / 2 - 8;
+    <Stack spacing={1}>
+      {rows.map((c, i) => {
+        const isChosen = c.token === step.chosenToken;
         return (
-          <text
-            key={`w-${c.wordIdx}`}
-            x={mx}
-            y={my}
-            textAnchor="middle"
-            fill={labelColor}
-            fontSize={9}
-            fontWeight="600"
-          >
-            w={inputWeights[c.wordIdx]!.toFixed(2)}
-          </text>
+          <Box key={`${c.token}-${i}`} sx={{ opacity: c.excluded ? 0.45 : 1 }}>
+            <Box
+              sx={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "baseline",
+                mb: 0.25,
+              }}
+            >
+              <Tooltip
+                title={
+                  c.token === ""
+                    ? "Special control token (usually end-of-turn): a real vocabulary entry that renders as no text."
+                    : `logprob: ${c.logprob.toFixed(4)} · raw prob: ${(c.prob * 100).toFixed(2)}%${c.excluded ? " · excluded by top_k" : ""}`
+                }
+              >
+                <Typography
+                  variant="body2"
+                  fontFamily="monospace"
+                  fontWeight={isChosen ? "bold" : "normal"}
+                  sx={{
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    maxWidth: "60%",
+                  }}
+                >
+                  {isChosen ? "★ " : ""}
+                  &ldquo;{formatToken(c.token)}&rdquo;
+                  {c.excluded ? " (cut)" : ""}
+                </Typography>
+              </Tooltip>
+              <Typography variant="body2" color="text.secondary">
+                {(c.displayProb * 100).toFixed(2)}%
+              </Typography>
+            </Box>
+            <Box
+              sx={{
+                height: 18,
+                borderRadius: 1,
+                bgcolor: theme.palette.action.hover,
+                overflow: "hidden",
+              }}
+            >
+              <Box
+                sx={{
+                  height: "100%",
+                  width: `${Math.max(1.5, (c.displayProb / maxProb) * 100)}%`,
+                  borderRadius: 1,
+                  bgcolor: isChosen
+                    ? theme.palette.primary.main
+                    : theme.palette.text.disabled,
+                  transition: "width 0.3s",
+                }}
+              />
+            </Box>
+          </Box>
         );
       })}
-
-      {/* Input node */}
-      <circle
-        cx={inX}
-        cy={inY}
-        r={28}
-        fill="transparent"
-        stroke={circleStroke}
-        strokeWidth={3}
-      />
-      <text
-        x={inX}
-        y={inY}
-        textAnchor="middle"
-        dominantBaseline="central"
-        fill={textColor}
-        fontSize={13}
-        fontWeight="bold"
-      >
-        {inputWord}
-      </text>
-
-      {/* Output nodes */}
-      {candidates.map((c, i) => (
-        <g key={`o-${c.wordIdx}`}>
-          <circle
-            cx={outX}
-            cy={outYs[i]!}
-            r={20}
-            fill="transparent"
-            stroke={c.isTarget ? "#2e7d32" : circleStroke}
-            strokeWidth={c.isTarget ? 3.5 : 2}
-          />
-          <text
-            x={outX}
-            y={outYs[i]!}
-            textAnchor="middle"
-            dominantBaseline="central"
-            fill={c.isTarget ? "#2e7d32" : textColor}
-            fontSize={10}
-            fontWeight={c.isTarget ? "bold" : "normal"}
-          >
-            {c.word}
-          </text>
-
-          {/* Probability bar */}
-          <rect
-            x={outX + 26}
-            y={outYs[i]! - 7}
-            width={Math.max(2, c.prob * 100)}
-            height={14}
-            rx={3}
-            fill={c.isTarget ? "#2e7d3288" : theme.palette.primary.main + "55"}
-          />
-          <text
-            x={outX + 32 + c.prob * 100}
-            y={outYs[i]!}
-            dominantBaseline="central"
-            fill={labelColor}
-            fontSize={10}
-          >
-            {(c.prob * 100).toFixed(1)}%
-          </text>
-        </g>
-      ))}
-
-      {/* Column labels */}
-      <text
-        x={inX}
-        y={14}
-        textAnchor="middle"
-        fill={labelColor}
-        fontSize={11}
-      >
-        Context Word
-      </text>
-      <text
-        x={outX + 30}
-        y={14}
-        textAnchor="middle"
-        fill={labelColor}
-        fontSize={11}
-      >
-        Predicted Next Word
-      </text>
-    </svg>
+    </Stack>
   );
 }
 
-// ─── Main Component ───────────────────────────────────────
+// ─── Main Component ─────────────────────────────────────────
 
 export function TextGeneration() {
-  const [sentIdx, setSentIdx] = useState(0);
-  const [wordPos, setWordPos] = useState(0);
-  const [trainState, setTrainState] = useState<TrainState>(() => ({
-    weights: initWeights(),
-    loss: null,
-    epoch: 0,
-  }));
-  const [isTraining, setIsTraining] = useState(false);
+  const [text, setText] = useState("The cat sat on the");
+  const [last, setLast] = useState<Step | null>(null);
 
-  const sentence = SENTENCES[sentIdx]!;
-  const maxPos = sentence.length - 2;
-  const clampedPos = Math.min(wordPos, maxPos);
-  const inputWord = sentence[clampedPos]!;
-  const targetWord = sentence[clampedPos + 1]!;
-  const inputIdx = W2I[inputWord]!;
-  const targetIdx = W2I[targetWord]!;
+  const [models, setModels] = useState<OllamaModel[]>([]);
+  const [model, setModel] = useState("");
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [modelsError, setModelsError] = useState<string | null>(null);
 
-  const probs = useMemo(
-    () => softmax(trainState.weights[inputIdx]!),
-    [trainState.weights, inputIdx],
+  const [temperature, setTemperature] = useState(0.7);
+  const [topK, setTopK] = useState(10);
+  const [seedText, setSeedText] = useState("");
+
+  const [isRunning, setIsRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Load model list, default to the smallest model capable of completion.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/ollama/tags");
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.error ?? "Failed to list models.");
+        const all: OllamaModel[] = data.models ?? [];
+        const capable = all.filter((m) =>
+          (m.capabilities ?? []).includes("completion"),
+        );
+        const pool = capable.length > 0 ? capable : all;
+        const smallest = [...pool].sort(
+          (a, b) =>
+            parameterCount(a.details?.parameter_size) -
+            parameterCount(b.details?.parameter_size),
+        )[0];
+        if (!cancelled) {
+          setModels(pool);
+          setModel(smallest?.name ?? "");
+        }
+      } catch (e) {
+        if (!cancelled)
+          setModelsError(
+            e instanceof Error ? e.message : "Could not reach Ollama.",
+          );
+      } finally {
+        if (!cancelled) setModelsLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const parseSeed = useCallback((): number | undefined => {
+    const t = seedText.trim();
+    if (t === "") return undefined;
+    const n = Number.parseInt(t, 10);
+    return Number.isNaN(n) ? undefined : n;
+  }, [seedText]);
+
+  const requestOneToken = useCallback(
+    async (prompt: string) => {
+      const seed = parseSeed();
+      const res = await fetch("/api/ollama/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          prompt,
+          temperature,
+          top_k: topK,
+          topLogprobs: NUM_CANDIDATES,
+          ...(seed !== undefined ? { seed } : {}),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error ?? "Generation failed.");
+      return data as { response: string; candidates: Candidate[] };
+    },
+    [model, temperature, topK, parseSeed],
   );
 
-  const predictedIdx = useMemo(() => {
-    let best = 0;
-    for (let i = 1; i < probs.length; i++) {
-      if (probs[i]! > probs[best]!) best = i;
-    }
-    return best;
-  }, [probs]);
-
-  const predictedWord = VOCAB[predictedIdx]!;
-  const isCorrect = predictedIdx === targetIdx;
-
-  const candidates = useMemo((): Candidate[] => {
-    const indexed = probs.map((p, i) => ({
-      wordIdx: i,
-      word: VOCAB[i]!,
-      prob: p,
-      isTarget: i === targetIdx,
-    }));
-    indexed.sort((a, b) => b.prob - a.prob);
-    const top = indexed.slice(0, TOP_N);
-    if (!top.some((c) => c.isTarget)) {
-      top.pop();
-      top.push(indexed.find((c) => c.isTarget)!);
-      top.sort((a, b) => b.prob - a.prob);
-    }
-    return top;
-  }, [probs, targetIdx]);
-
-  // Auto-training loop
-  useEffect(() => {
-    if (!isTraining) return;
-    const id = setInterval(() => {
-      setTrainState((prev) => {
-        const result = trainEpoch(prev.weights, LEARNING_RATE);
-        if (result.loss < 0.05 || prev.epoch >= 500) {
-          setIsTraining(false);
-        }
-        return {
-          weights: result.weights,
-          loss: result.loss,
-          epoch: prev.epoch + 1,
-        };
+  // Run model: generate the next token and append it to the text box.
+  const handleRun = useCallback(async () => {
+    if (!model || text === "" || isRunning) return;
+    setIsRunning(true);
+    setError(null);
+    const runTemp = temperature;
+    const runTopK = topK;
+    try {
+      const data = await requestOneToken(text);
+      setText(text + data.response);
+      setLast({
+        promptSnapshot: text,
+        chosenToken: data.response,
+        candidates: data.candidates,
+        temperature: runTemp,
+        topK: runTopK,
       });
-    }, 80);
-    return () => clearInterval(id);
-  }, [isTraining]);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Generation failed.");
+    } finally {
+      setIsRunning(false);
+    }
+  }, [model, text, isRunning, requestOneToken, temperature, topK]);
 
-  const handleTrainStep = useCallback(() => {
-    setTrainState((prev) => {
-      const result = trainEpoch(prev.weights, LEARNING_RATE);
-      return {
-        weights: result.weights,
-        loss: result.loss,
-        epoch: prev.epoch + 1,
-      };
-    });
+  // Rerun: re-sample the same prompt, replacing the last generated token.
+  const handleRerun = useCallback(async () => {
+    if (last === null || isRunning) return;
+    setIsRunning(true);
+    setError(null);
+    const runTemp = temperature;
+    const runTopK = topK;
+    try {
+      const data = await requestOneToken(last.promptSnapshot);
+      setText(last.promptSnapshot + data.response);
+      setLast({
+        promptSnapshot: last.promptSnapshot,
+        chosenToken: data.response,
+        candidates: data.candidates,
+        temperature: runTemp,
+        topK: runTopK,
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Generation failed.");
+    } finally {
+      setIsRunning(false);
+    }
+  }, [last, isRunning, requestOneToken, temperature, topK]);
+
+  const randomizeSeed = useCallback(() => {
+    setSeedText(String(Math.floor(Math.random() * 1_000_000)));
   }, []);
 
-  const handleReset = useCallback(() => {
-    setIsTraining(false);
-    setTrainState({ weights: initWeights(), loss: null, epoch: 0 });
-  }, []);
-
-  const handleSentenceChange = (idx: number) => {
-    setSentIdx(idx);
-    setWordPos(0);
-  };
+  const canRun = model !== "" && text !== "" && !isRunning;
 
   return (
     <Box sx={{ pt: 2, pb: 1, px: 1 }}>
       <Typography variant="h5" fontWeight="bold" gutterBottom>
-        How LLMs Predict Text
-      </Typography>
-      <Typography variant="body1" color="text.secondary" sx={{ mb: 1.5 }}>
-        Large Language Models predict the <strong>next word</strong> based on
-        context. This simplified bigram model learns which word typically follows
-        another by adjusting weights during training — just like a real LLM.
+        Next-Token Prediction
       </Typography>
 
-      <Box sx={{ display: "flex", gap: 2, alignItems: "stretch" }}>
-        {/* ── Left Panel: Sentences & Prediction ── */}
-        <Paper elevation={2} sx={{ p: 2, borderRadius: 3, flex: "0 0 220px" }}>
-          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
-            Training Sentences
-          </Typography>
-          <Divider sx={{ mb: 1 }} />
-          <Stack spacing={0.5} sx={{ mb: 1.5 }}>
-            {SENTENCES.map((s, i) => (
-              <Chip
-                key={i}
-                label={s.join(" ")}
-                onClick={() => handleSentenceChange(i)}
-                variant={i === sentIdx ? "filled" : "outlined"}
-                color={i === sentIdx ? "primary" : "default"}
-                size="small"
-                sx={{
-                  justifyContent: "flex-start",
-                  height: "auto",
-                  py: 0.5,
-                  "& .MuiChip-label": { whiteSpace: "normal" },
-                }}
-              />
-            ))}
-          </Stack>
+      {(modelsError || error) && (
+        <Alert severity="error" sx={{ mb: 2 }} onClose={() => {
+          setModelsError(null);
+          setError(null);
+        }}>
+          {modelsError ?? error}{" "}
+          {((modelsError ?? error) ?? "").includes("11434") &&
+            "Is `ollama serve` running?"}
+        </Alert>
+      )}
 
-          <Divider sx={{ mb: 1 }} />
-          <Typography variant="subtitle2" fontWeight="bold" gutterBottom>
-            Context
-          </Typography>
-          <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, mb: 1 }}>
-            {sentence.map((word, i) => {
-              const isInput = i === clampedPos;
-              const isPredicting = i === clampedPos + 1;
-              return (
-                <Chip
-                  key={i}
-                  label={isPredicting ? "?" : word}
-                  size="small"
-                  onClick={
-                    i <= maxPos ? () => setWordPos(i) : undefined
-                  }
-                  sx={{
-                    cursor: i <= maxPos ? "pointer" : "default",
-                    fontWeight: isInput ? "bold" : "normal",
-                    borderColor: isInput
-                      ? "primary.main"
-                      : isPredicting
-                        ? "secondary.main"
-                        : undefined,
-                    borderWidth: isInput || isPredicting ? 2 : 1,
-                    opacity: i > clampedPos + 1 ? 0.35 : 1,
-                  }}
-                  variant="outlined"
-                />
-              );
-            })}
-          </Box>
-          <Box
-            sx={{ display: "flex", justifyContent: "center", gap: 1, mb: 1 }}
-          >
-            <IconButton
-              size="small"
-              onClick={() => setWordPos(Math.max(0, clampedPos - 1))}
-              disabled={clampedPos === 0}
-            >
-              <NavigateBeforeRoundedIcon />
-            </IconButton>
-            <IconButton
-              size="small"
-              onClick={() => setWordPos(Math.min(maxPos, clampedPos + 1))}
-              disabled={clampedPos >= maxPos}
-            >
-              <NavigateNextRoundedIcon />
-            </IconButton>
-          </Box>
-
-          <Divider sx={{ my: 1 }} />
-          <Typography variant="subtitle2" fontWeight="bold" gutterBottom>
-            Prediction
-          </Typography>
-          <Box sx={{ textAlign: "center", py: 1 }}>
-            <Typography variant="body2" color="text.secondary">
-              After &ldquo;<strong>{inputWord}</strong>&rdquo;, model predicts:
-            </Typography>
-            <Typography
-              variant="h6"
-              fontWeight="bold"
-              sx={{ color: isCorrect ? "#2e7d32" : "#f44336" }}
-            >
-              &ldquo;{predictedWord}&rdquo; (
-              {(probs[predictedIdx]! * 100).toFixed(1)}%)
-            </Typography>
-            <Typography variant="body2" color="text.secondary">
-              Correct: &ldquo;<strong>{targetWord}</strong>&rdquo;{" "}
-              {isCorrect ? "✓" : "✗"}
-            </Typography>
-          </Box>
-        </Paper>
-
-        {/* ── Center Panel: Diagram ── */}
-        <Paper elevation={2} sx={{ p: 2, borderRadius: 3, flex: 1 }}>
-          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
-            Next-Word Prediction Network
-          </Typography>
-          <BigramDiagram
-            inputWord={inputWord}
-            candidates={candidates}
-            inputWeights={trainState.weights[inputIdx]!}
+      {/* ── Input + Run controls ── */}
+      <Paper elevation={2} sx={{ p: 2, borderRadius: 3, mb: 2 }}>
+        <Box sx={{ display: "flex", gap: 1.5, alignItems: "stretch" }}>
+          <TextField
+            label="Input text"
+            multiline
+            minRows={3}
+            fullWidth
+            size="small"
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            sx={{ flex: 1 }}
           />
-        </Paper>
+          <Stack spacing={1} sx={{ flex: "0 0 auto" }}>
+            <Button
+              variant="contained"
+              startIcon={
+                isRunning ? (
+                  <CircularProgress size={16} color="inherit" />
+                ) : (
+                  <PlayArrowRoundedIcon />
+                )
+              }
+              onClick={handleRun}
+              disabled={!canRun}
+            >
+              Run model
+            </Button>
+            <Tooltip title="Discard the last token and sample the same position again">
+              <span>
+                <Button
+                  variant="outlined"
+                  startIcon={<RefreshRoundedIcon />}
+                  onClick={handleRerun}
+                  disabled={last === null || isRunning}
+                  fullWidth
+                >
+                  Rerun
+                </Button>
+              </span>
+            </Tooltip>
+          </Stack>
+        </Box>
+      </Paper>
 
-        {/* ── Right Panel: Training Controls ── */}
-        <Paper elevation={2} sx={{ p: 2, borderRadius: 3, flex: "0 0 180px" }}>
+      <Box
+        sx={{
+          display: "flex",
+          gap: 2,
+          alignItems: "stretch",
+          flexWrap: "wrap",
+        }}
+      >
+        {/* ── Controls ── */}
+        <Paper elevation={2} sx={{ p: 2, borderRadius: 3, flex: "1 1 280px" }}>
           <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
-            Training
+            Controls
           </Typography>
           <Divider sx={{ mb: 2 }} />
-          <Stack spacing={1.5}>
-            <Button
-              variant="contained"
-              startIcon={<SkipNextRoundedIcon />}
-              onClick={handleTrainStep}
-              disabled={isTraining}
-              fullWidth
-              size="small"
-            >
-              Train Step
-            </Button>
-            <Button
-              variant="contained"
-              color={isTraining ? "error" : "success"}
-              startIcon={
-                isTraining ? <StopRoundedIcon /> : <PlayArrowRoundedIcon />
-              }
-              onClick={() => setIsTraining((t) => !t)}
-              fullWidth
-              size="small"
-            >
-              {isTraining ? "Stop" : "Auto Train"}
-            </Button>
-            <Button
-              variant="outlined"
-              startIcon={<RestartAltRoundedIcon />}
-              onClick={handleReset}
-              fullWidth
-              size="small"
-            >
-              Reset
-            </Button>
-          </Stack>
 
-          <Divider sx={{ my: 2 }} />
-          <Typography variant="subtitle2" fontWeight="bold" gutterBottom>
-            Metrics
-          </Typography>
-          <Box sx={{ mb: 1 }}>
-            <Typography variant="body2" color="text.secondary">
-              Epoch
-            </Typography>
-            <Typography variant="h6" fontWeight="bold">
-              {trainState.epoch}
-            </Typography>
-          </Box>
-          <Box>
-            <Typography variant="body2" color="text.secondary">
-              Avg Loss
-            </Typography>
-            <Typography
-              variant="h6"
-              fontWeight="bold"
-              sx={{
-                color:
-                  trainState.loss !== null && trainState.loss < 0.5
-                    ? "#2e7d32"
-                    : undefined,
-              }}
+          <FormControl fullWidth size="small" sx={{ mb: 2 }}>
+            <InputLabel id="model-select-label">Model</InputLabel>
+            <Select
+              labelId="model-select-label"
+              label="Model"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              disabled={modelsLoading || models.length === 0}
             >
-              {trainState.loss !== null ? trainState.loss.toFixed(4) : "—"}
+              {models.map((m) => (
+                <MenuItem key={m.name} value={m.name}>
+                  {m.name}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          {modelsLoading && (
+            <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 2 }}>
+              <CircularProgress size={16} />
+              <Typography variant="body2" color="text.secondary">
+                Loading models from Ollama…
+              </Typography>
+            </Box>
+          )}
+
+          <Typography variant="body2" gutterBottom>
+            Temperature: <strong>{temperature.toFixed(2)}</strong>
+          </Typography>
+          <Slider
+            value={temperature}
+            onChange={(_, v) => setTemperature(v as number)}
+            min={0}
+            max={2}
+            step={0.05}
+            valueLabelDisplay="auto"
+            sx={{ mb: 1 }}
+          />
+
+          <Typography variant="body2" gutterBottom>
+            Top K: <strong>{topK}</strong>
+            {topK === 0 && " (off)"}
+          </Typography>
+          <Slider
+            value={topK}
+            onChange={(_, v) => setTopK(v as number)}
+            min={0}
+            max={10}
+            step={1}
+            valueLabelDisplay="auto"
+            sx={{ mb: 1 }}
+          />
+
+          <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
+            <TextField
+              label="Seed (empty = random)"
+              size="small"
+              value={seedText}
+              onChange={(e) => setSeedText(e.target.value)}
+              placeholder="e.g. 42"
+              sx={{ flex: 1 }}
+            />
+            <Tooltip title="Randomize seed">
+              <IconButton onClick={randomizeSeed} size="small">
+                <CasinoRoundedIcon />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="Clear seed (random every run)">
+              <IconButton onClick={() => setSeedText("")} size="small">
+                <ClearRoundedIcon />
+              </IconButton>
+            </Tooltip>
+          </Box>
+        </Paper>
+
+        {/* ── Histogram ── */}
+        <Paper
+          elevation={2}
+          sx={{ p: 2, borderRadius: 3, flex: "2 1 340px" }}
+        >
+          <Box
+            sx={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              flexWrap: "wrap",
+              gap: 1,
+              mb: 1,
+            }}
+          >
+            <Typography variant="subtitle1" fontWeight="bold">
+              Next-token probabilities
             </Typography>
           </Box>
+          <Divider sx={{ mb: 1.5 }} />
+
+          {last == null ? (<></>
+          ) : (
+            <>
+              {last.chosenToken === "" && (
+                <Alert severity="info" sx={{ mb: 1.5 }}>
+                  The model sampled its end-of-turn control token, so no text
+                  was appended. Click <strong>Rerun</strong> to draw a different
+                  token from the same distribution.
+                </Alert>
+              )}
+              <Histogram step={last} />
+            </>
+          )}
         </Paper>
       </Box>
     </Box>

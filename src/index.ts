@@ -6,6 +6,92 @@ const server = serve({
     // Serve index.html for all unmatched routes.
     "/*": index,
 
+    "/api/ollama/tags": {
+      async GET() {
+        try {
+          const res = await fetch("http://localhost:11434/api/tags");
+          const data = await res.json();
+          return Response.json(data, { status: res.status });
+        } catch (e) {
+          return Response.json(
+            { error: "Could not reach Ollama on localhost:11434. Is `ollama serve` running?" },
+            { status: 502 },
+          );
+        }
+      },
+    },
+
+    "/api/ollama/generate": {
+      async POST(req) {
+        try {
+          const body = (await req.json()) as {
+            model: string;
+            prompt: string;
+            temperature?: number;
+            top_k?: number;
+            topLogprobs?: number;
+            seed?: number;
+          };
+          if (!body.model || !body.prompt) {
+            return Response.json(
+              { error: "Missing required fields: model, prompt." },
+              { status: 400 },
+            );
+          }
+          const topLogprobs = Math.min(
+            20,
+            Math.max(1, Math.round(body.topLogprobs ?? 10)),
+          );
+          const options: Record<string, unknown> = {
+            // num_predict is intentionally hardcoded: one token per step.
+            num_predict: 1,
+          };
+          if (body.temperature !== undefined) options.temperature = body.temperature;
+          if (body.top_k !== undefined) options.top_k = body.top_k;
+          if (body.seed !== undefined) options.seed = body.seed;
+
+          const res = await fetch("http://localhost:11434/api/generate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: body.model,
+              prompt: body.prompt,
+              stream: false,
+              // Raw mode: no chat template. The prompt is completed verbatim,
+              // so every run is a true continuation of the text box.
+              raw: true,
+              logprobs: true,
+              top_logprobs: topLogprobs,
+              options,
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            return Response.json(
+              { error: data?.error ?? "Ollama request failed." },
+              { status: res.status },
+            );
+          }
+          const entry = data?.logprobs?.[0];
+          const candidates = (entry?.top_logprobs ?? []).map(
+            (t: { token: string; logprob: number }) => ({
+              token: t.token,
+              logprob: t.logprob,
+              prob: Math.exp(t.logprob),
+            }),
+          );
+          return Response.json({
+            response: data.response ?? "",
+            candidates,
+          });
+        } catch (e) {
+          return Response.json(
+            { error: "Could not reach Ollama on localhost:11434. Is `ollama serve` running?" },
+            { status: 502 },
+          );
+        }
+      },
+    },
     "/api/hello": {
       async GET(req) {
         return Response.json({
