@@ -24,6 +24,7 @@ import AddRoundedIcon from "@mui/icons-material/AddRounded";
 import {
   CACHED_NOMIC_EMBEDDINGS,
 } from "./cachedNomicEmbeddings";
+import { useOllamaOffline } from "./useOllamaStatus";
 
 const MAX_SENTENCES = 5;
 
@@ -563,6 +564,27 @@ export function VectorEmbeddings() {
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   const [viewMode, setViewMode] = useState<"2d" | "3d">("2d");
 
+  // Offline demo mode: Ollama unreachable → fixed cached sentences, no
+  // add/remove/typing. All chart math stays local.
+  const isOffline = useOllamaOffline(modelsError);
+
+  // When offline mode engages, reset to the fixed demo sentences with
+  // bundled vectors so the map always works without Ollama.
+  useEffect(() => {
+    if (!isOffline) return;
+    setSentences(
+      DEFAULT_SENTENCES.map((text, i) => ({
+        id: i,
+        text,
+        color: COLORS[i % COLORS.length]!,
+        embedding: CACHED_NOMIC_EMBEDDINGS[text] ?? null,
+      })),
+    );
+    nextId.current = DEFAULT_SENTENCES.length;
+    setSelectedIds([]);
+    setEmbedError(null);
+  }, [isOffline]);
+
   // Persist sentence texts across tab switches (keep-alive) and browser
   // reloads. Vectors are NOT stored: they are re-resolved via the bundled
   // nomic cache / Ollama embed flow so they never go stale per model.
@@ -627,8 +649,9 @@ export function VectorEmbeddings() {
   }, []);
 
   // Embed any sentences missing vectors (debounced, single batched request).
+  // Skipped in offline demo mode — bundled vectors are already set.
   useEffect(() => {
-    if (!model) return;
+    if (!model || isOffline) return;
     const missing = sentences.filter((s) => s.embedding === null);
     if (missing.length === 0) return;
     const timer = setTimeout(async () => {
@@ -656,9 +679,10 @@ export function VectorEmbeddings() {
       }
     }, 500);
     return () => clearTimeout(timer);
-  }, [model, sentences]);
+  }, [model, sentences, isOffline]);
 
   const handleAdd = useCallback(() => {
+    if (isOffline) return;
     const text = input.trim();
     if (!text) return;
     setSentences((prev) => {
@@ -668,12 +692,13 @@ export function VectorEmbeddings() {
       return [...prev, { id: nextId.current++, text, color, embedding: cachedEmbeddingFor(text, model) }];
     });
     setInput("");
-  }, [input, model]);
+  }, [input, model, isOffline]);
 
   const handleRemove = useCallback((id: number) => {
+    if (isOffline) return;
     setSentences((prev) => prev.filter((s) => s.id !== id));
     setSelectedIds((prev) => prev.filter((sid) => sid !== id));
-  }, []);
+  }, [isOffline]);
 
   const handleTogglePoint = useCallback((id: number) => {
     setSelectedIds((prev) =>
@@ -721,7 +746,7 @@ export function VectorEmbeddings() {
         to 2D. Semantically similar sentences land close together.
       </Typography>
 
-      {error && (
+      {!isOffline && error && (
         <Alert
           severity="error"
           sx={{ mb: 2 }}
@@ -734,6 +759,15 @@ export function VectorEmbeddings() {
           {error.includes("11434") && "Is `ollama serve` running?"}
         </Alert>
       )}
+      {isOffline && embedError && (
+        <Alert
+          severity="error"
+          sx={{ mb: 2 }}
+          onClose={() => setEmbedError(null)}
+        >
+          {embedError}
+        </Alert>
+      )}
 
       <Box sx={{ display: "flex", gap: 2, alignItems: "stretch", flexWrap: "wrap" }}>
         {/* ── Left: sentence list ── */}
@@ -743,7 +777,7 @@ export function VectorEmbeddings() {
             <Select
               labelId="embed-model-label"
               label="Embedding model"
-              value={model}
+              value={isOffline ? "demo-mode" : model}
               onChange={(e) => {
                 const next = e.target.value;
                 setModel(next);
@@ -753,13 +787,17 @@ export function VectorEmbeddings() {
                   prev.map((s) => ({ ...s, embedding: cachedEmbeddingFor(s.text, next) })),
                 );
               }}
-              disabled={modelsLoading || models.length === 0}
+              disabled={isOffline || modelsLoading || models.length === 0}
             >
-              {models.map((m) => (
-                <MenuItem key={m.name} value={m.name}>
-                  {m.name}
-                </MenuItem>
-              ))}
+              {isOffline ? (
+                <MenuItem value="demo-mode">Demo Mode</MenuItem>
+              ) : (
+                models.map((m) => (
+                  <MenuItem key={m.name} value={m.name}>
+                    {m.name}
+                  </MenuItem>
+                ))
+              )}
             </Select>
           </FormControl>
           {modelsLoading && (
@@ -814,12 +852,12 @@ export function VectorEmbeddings() {
                       </Typography>
                     )}
                   </Box>
-                  <Tooltip title="Remove">
+                  <Tooltip title={isOffline ? "Disabled in demo mode" : "Remove"}>
                     <span>
                       <IconButton
                         size="small"
                         onClick={() => handleRemove(s.id)}
-                        disabled={sentences.length <= 1}
+                        disabled={isOffline || sentences.length <= 1}
                       >
                         <DeleteRoundedIcon fontSize="small" />
                       </IconButton>
@@ -831,7 +869,7 @@ export function VectorEmbeddings() {
           </Stack>
           <Box sx={{ display: "flex", gap: 1 }}>
             <TextField
-              label={sentences.length >= MAX_SENTENCES ? `Max ${MAX_SENTENCES} sentences` : "Add a sentence"}
+              label={isOffline ? "Demo mode: sentences locked" : sentences.length >= MAX_SENTENCES ? `Max ${MAX_SENTENCES} sentences` : "Add a sentence"}
               size="small"
               fullWidth
               value={input}
@@ -839,12 +877,12 @@ export function VectorEmbeddings() {
               onKeyDown={(e) => {
                 if (e.key === "Enter") handleAdd();
               }}
-              disabled={sentences.length >= MAX_SENTENCES}
+              disabled={isOffline || sentences.length >= MAX_SENTENCES}
             />
             <Button
               variant="contained"
               onClick={handleAdd}
-              disabled={sentences.length >= MAX_SENTENCES || input.trim() === ""}
+              disabled={isOffline || sentences.length >= MAX_SENTENCES || input.trim() === ""}
               sx={{ flexShrink: 0 }}
             >
               <AddRoundedIcon />

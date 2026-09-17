@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   Box,
   Typography,
@@ -22,6 +22,8 @@ import PlayArrowRoundedIcon from "@mui/icons-material/PlayArrowRounded";
 import RefreshRoundedIcon from "@mui/icons-material/RefreshRounded";
 import CasinoRoundedIcon from "@mui/icons-material/CasinoRounded";
 import ClearRoundedIcon from "@mui/icons-material/ClearRounded";
+import { useOllamaOffline } from "./useOllamaStatus";
+import { OFFLINE_TEXT_PRESETS } from "./offlineFallbacks";
 
 // ─── Types ──────────────────────────────────────────────────
 
@@ -225,6 +227,26 @@ export function TextGeneration() {
   const [isRunning, setIsRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Offline demo mode: Ollama unreachable → fixed presets, no free typing.
+  const isOffline = useOllamaOffline(modelsError);
+  const [offlinePresetId, setOfflinePresetId] = useState(
+    OFFLINE_TEXT_PRESETS[0]!.id,
+  );
+  const offlineStepRef = useRef(0);
+  const activePreset =
+    OFFLINE_TEXT_PRESETS.find((p) => p.id === offlinePresetId) ??
+    OFFLINE_TEXT_PRESETS[0]!;
+
+  // When offline mode engages or the preset changes, lock the text box to
+  // the fixed preset prompt.
+  useEffect(() => {
+    if (!isOffline) return;
+    setText(activePreset.prompt);
+    setLast(null);
+    offlineStepRef.current = 0;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOffline, offlinePresetId]);
+
   // Load model list, default to the smallest model capable of completion.
   useEffect(() => {
     let cancelled = false;
@@ -291,8 +313,24 @@ export function TextGeneration() {
   );
 
   // Run model: generate the next token and append it to the text box.
+  // Offline: play back the next canned variant for the active preset.
   const handleRun = useCallback(async () => {
-    if (!model || text === "" || isRunning) return;
+    if (text === "" || isRunning) return;
+    if (isOffline) {
+      const variants = activePreset.variants;
+      const variant = variants[offlineStepRef.current % variants.length]!;
+      offlineStepRef.current += 1;
+      setText(activePreset.prompt + variant.response);
+      setLast({
+        promptSnapshot: activePreset.prompt,
+        chosenToken: variant.response,
+        candidates: variant.candidates,
+        temperature,
+        topK,
+      });
+      return;
+    }
+    if (!model) return;
     setIsRunning(true);
     setError(null);
     const runTemp = temperature;
@@ -312,11 +350,26 @@ export function TextGeneration() {
     } finally {
       setIsRunning(false);
     }
-  }, [model, text, isRunning, requestOneToken, temperature, topK]);
+  }, [model, text, isRunning, requestOneToken, temperature, topK, isOffline, activePreset]);
 
   // Rerun: re-sample the same prompt, replacing the last generated token.
+  // Offline: cycle to the next canned variant for the same prompt.
   const handleRerun = useCallback(async () => {
     if (last === null || isRunning) return;
+    if (isOffline) {
+      const variants = activePreset.variants;
+      const variant = variants[offlineStepRef.current % variants.length]!;
+      offlineStepRef.current += 1;
+      setText(last.promptSnapshot + variant.response);
+      setLast({
+        promptSnapshot: last.promptSnapshot,
+        chosenToken: variant.response,
+        candidates: variant.candidates,
+        temperature,
+        topK,
+      });
+      return;
+    }
     setIsRunning(true);
     setError(null);
     const runTemp = temperature;
@@ -336,13 +389,13 @@ export function TextGeneration() {
     } finally {
       setIsRunning(false);
     }
-  }, [last, isRunning, requestOneToken, temperature, topK]);
+  }, [last, isRunning, requestOneToken, temperature, topK, isOffline, activePreset]);
 
   const randomizeSeed = useCallback(() => {
     setSeedText(String(Math.floor(Math.random() * 1_000_000)));
   }, []);
 
-  const canRun = model !== "" && text !== "" && !isRunning;
+  const canRun = (isOffline || model !== "") && text !== "" && !isRunning;
 
   return (
     <Box sx={{ pt: 2, pb: 1, px: 1 }}>
@@ -356,7 +409,7 @@ export function TextGeneration() {
         temperature and top-K reshape the odds before each pick.
       </Typography>
 
-      {(modelsError || error) && (
+      {!isOffline && (modelsError || error) && (
         <Alert severity="error" sx={{ mb: 2 }} onClose={() => {
           setModelsError(null);
           setError(null);
@@ -366,12 +419,34 @@ export function TextGeneration() {
             "Is `ollama serve` running?"}
         </Alert>
       )}
+      {isOffline && error && (
+        <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError(null)}>
+          {error}
+        </Alert>
+      )}
 
       {/* ── Input + Run controls ── */}
       <Paper elevation={2} sx={{ p: 2, borderRadius: 3, mb: 2 }}>
+        {isOffline && (
+          <FormControl fullWidth size="small" sx={{ mb: 1.5 }}>
+            <InputLabel id="offline-preset-label">Demo example</InputLabel>
+            <Select
+              labelId="offline-preset-label"
+              label="Demo example"
+              value={offlinePresetId}
+              onChange={(e) => setOfflinePresetId(e.target.value)}
+            >
+              {OFFLINE_TEXT_PRESETS.map((p) => (
+                <MenuItem key={p.id} value={p.id}>
+                  {p.label}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+        )}
         <Box sx={{ display: "flex", gap: 1.5, alignItems: "stretch" }}>
           <TextField
-            label="Input text"
+            label={isOffline ? "Input text (locked in demo mode)" : "Input text"}
             multiline
             minRows={3}
             fullWidth
@@ -379,6 +454,7 @@ export function TextGeneration() {
             value={text}
             onChange={(e) => setText(e.target.value)}
             sx={{ flex: 1 }}
+            disabled={isOffline}
           />
           <Stack spacing={1} sx={{ flex: "0 0 auto" }}>
             <Button
@@ -432,15 +508,19 @@ export function TextGeneration() {
             <Select
               labelId="model-select-label"
               label="Model"
-              value={model}
+              value={isOffline ? "demo-mode" : model}
               onChange={(e) => setModel(e.target.value)}
-              disabled={modelsLoading || models.length === 0}
+              disabled={isOffline || modelsLoading || models.length === 0}
             >
-              {models.map((m) => (
-                <MenuItem key={m.name} value={m.name}>
-                  {m.name}
-                </MenuItem>
-              ))}
+              {isOffline ? (
+                <MenuItem value="demo-mode">Demo Mode</MenuItem>
+              ) : (
+                models.map((m) => (
+                  <MenuItem key={m.name} value={m.name}>
+                    {m.name}
+                  </MenuItem>
+                ))
+              )}
             </Select>
           </FormControl>
           {modelsLoading && (
@@ -481,20 +561,21 @@ export function TextGeneration() {
 
           <Box sx={{ display: "flex", gap: 1, alignItems: "center" }}>
             <TextField
-              label="Seed (empty = random)"
+              label={isOffline ? "Seed (disabled in demo mode)" : "Seed (empty = random)"}
               size="small"
               value={seedText}
               onChange={(e) => setSeedText(e.target.value)}
               placeholder="e.g. 42"
               sx={{ flex: 1 }}
+              disabled={isOffline}
             />
             <Tooltip title="Randomize seed">
-              <IconButton onClick={randomizeSeed} size="small">
+              <IconButton onClick={randomizeSeed} size="small" disabled={isOffline}>
                 <CasinoRoundedIcon />
               </IconButton>
             </Tooltip>
             <Tooltip title="Clear seed (random every run)">
-              <IconButton onClick={() => setSeedText("")} size="small">
+              <IconButton onClick={() => setSeedText("")} size="small" disabled={isOffline}>
                 <ClearRoundedIcon />
               </IconButton>
             </Tooltip>

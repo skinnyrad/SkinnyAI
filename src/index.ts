@@ -167,6 +167,18 @@ function toOllamaTools(ids: string[]) {
 
 const server = serve({
   routes: {
+    // Serve the favicon file directly — otherwise the "/*" catch-all below
+    // would return index.html for /skinny_ai.png and the icon breaks.
+    "/skinny_ai.png": async () => {
+      const file = Bun.file(new URL("./skinny_ai.png", import.meta.url));
+      return new Response(file, {
+        headers: {
+          "Content-Type": "image/png",
+          "Cache-Control": "public, max-age=86400",
+        },
+      });
+    },
+
     // Serve index.html for all unmatched routes.
     "/*": index,
 
@@ -431,15 +443,6 @@ const server = serve({
                 });
               }
               break;
-            }
-
-            if (content) {
-              trace.push({
-                kind: "llm",
-                title: `LLM thinking`,
-                body: content.slice(0, 2000),
-                raw: JSON.stringify(message).slice(0, 2000),
-              });
             }
 
             for (const call of toolCalls) {

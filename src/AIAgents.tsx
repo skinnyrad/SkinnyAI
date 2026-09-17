@@ -25,6 +25,8 @@ import {
 } from "@mui/material";
 import PlayArrowRoundedIcon from "@mui/icons-material/PlayArrowRounded";
 import RestartAltRoundedIcon from "@mui/icons-material/RestartAltRounded";
+import { useOllamaOffline } from "./useOllamaStatus";
+import { OFFLINE_AGENT_TRACES } from "./offlineFallbacks";
 
 const DEFAULT_SYSTEM_PROMPT =
   "You are a helpful assistant. Use available tools when needed, be concise, and explain your final answer clearly.";
@@ -245,6 +247,18 @@ export function AIAgents() {
   const approvalRef = useRef<((d: ApprovalDecision) => void) | null>(null);
   const runIdRef = useRef(0);
 
+  // Offline demo mode: Ollama unreachable → fixed tasks only, canned traces.
+  const isOffline = useOllamaOffline(modelsError);
+  const visibleTasks = isOffline ? TASKS.filter((t) => t.id !== "custom") : TASKS;
+
+  // If offline engages while "Free chat" is selected, fall back to math.
+  useEffect(() => {
+    if (isOffline && taskId === "custom") {
+      setTaskId(TASKS[0]!.id);
+      setPrompt(TASKS[0]!.request);
+    }
+  }, [isOffline, taskId]);
+
   // Load chat-capable models (exclude embedding-only), default smallest.
   useEffect(() => {
     let cancelled = false;
@@ -299,11 +313,12 @@ export function AIAgents() {
   }, []);
 
   const handleTaskChange = useCallback((id: string) => {
+    if (isOffline && id === "custom") return;
     setTaskId(id);
     const task = TASKS.find((t) => t.id === id);
     if (task && task.id !== "custom") setPrompt(task.request);
     if (task?.id === "custom") setPrompt("");
-  }, []);
+  }, [isOffline]);
 
   const waitForApproval = useCallback(() => {
     return new Promise<ApprovalDecision>((resolve) => {
@@ -312,7 +327,8 @@ export function AIAgents() {
   }, []);
 
   const handleRun = useCallback(async () => {
-    if (!model || !prompt.trim() || isRunning) return;
+    if (!prompt.trim() || isRunning) return;
+    if (!isOffline && !model) return;
     const runId = ++runIdRef.current;
     const alive = () => runIdRef.current === runId;
     const push = (step: TraceStep) => setTrace((prev) => [...prev, step]);
@@ -322,6 +338,43 @@ export function AIAgents() {
     setRunError(null);
     setPendingCall(null);
     setTrace([]);
+
+    // Offline demo: replay the canned trace with the same animated phases.
+    if (isOffline) {
+      const canned = OFFLINE_AGENT_TRACES[taskId] ?? [];
+      try {
+        await sleep(1000);
+        if (!alive()) return;
+        for (const step of canned) {
+          if (!alive()) return;
+          if (step.kind === "tool_call") {
+            setPhase("dispatching");
+            await sleep(250);
+            if (!alive()) return;
+            setPhase("executing");
+            await sleep(1000);
+          } else if (step.kind === "llm") {
+            setPhase("thinking");
+            await sleep(1200);
+          } else {
+            setPhase("relaying");
+            await sleep(250);
+          }
+          if (!alive()) return;
+          push({ ...step });
+        }
+      } catch (e) {
+        if (!alive()) return;
+        setRunError(e instanceof Error ? e.message : "Agent run failed.");
+      } finally {
+        if (alive()) {
+          setIsRunning(false);
+          setPhase("idle");
+          setPendingCall(null);
+        }
+      }
+      return;
+    }
 
     const userPrompt = prompt.trim();
     const toolIds = [...enabledTools];
@@ -385,15 +438,6 @@ export function AIAgents() {
             });
           }
           break;
-        }
-
-        if (content) {
-          push({
-            kind: "llm",
-            title: `LLM thinking`,
-            body: content.slice(0, 2000),
-            raw: JSON.stringify(message).slice(0, 2000),
-          });
         }
 
         for (let ci = 0; ci < toolCalls.length; ci++) {
@@ -531,7 +575,7 @@ export function AIAgents() {
         setPendingCall(null);
       }
     }
-  }, [model, prompt, isRunning, systemPrompt, enabledTools, waitForApproval]);
+  }, [model, prompt, isRunning, systemPrompt, enabledTools, waitForApproval, isOffline, taskId]);
 
   const handleStop = useCallback(() => {
     runIdRef.current += 1;
@@ -581,7 +625,7 @@ export function AIAgents() {
   }, [trace]);
 
   const error = modelsError ?? runError;
-  const canRun = model !== "" && prompt.trim() !== "" && !isRunning;
+  const canRun = (isOffline || model !== "") && prompt.trim() !== "" && !isRunning;
   const visibleTrace = useMemo(
     () =>
       trace.filter(
@@ -618,7 +662,7 @@ export function AIAgents() {
         result goes back in. 
       </Typography>
 
-      {error && (
+      {!isOffline && error && (
         <Alert
           severity="error"
           sx={{ mb: 2 }}
@@ -630,6 +674,15 @@ export function AIAgents() {
           {error} {error.includes("11434") && "Is `ollama serve` running?"}{" "}
           {error.toLowerCase().includes("tool") &&
             "Tip: pull a tool-capable model, e.g. `ollama pull qwen2.5`."}
+        </Alert>
+      )}
+      {isOffline && runError && (
+        <Alert
+          severity="error"
+          sx={{ mb: 2 }}
+          onClose={() => setRunError(null)}
+        >
+          {runError}
         </Alert>
       )}
 
@@ -657,7 +710,7 @@ export function AIAgents() {
                 value={taskId}
                 onChange={(e) => handleTaskChange(e.target.value)}
               >
-                {TASKS.map((t) => (
+                {visibleTasks.map((t) => (
                   <MenuItem key={t.id} value={t.id}>
                     {t.label}
                   </MenuItem>
@@ -665,7 +718,7 @@ export function AIAgents() {
               </Select>
             </FormControl>
             <TextField
-              label="Ask"
+              label={isOffline ? "Ask (locked in demo mode)" : "Ask"}
               multiline
               minRows={3}
               fullWidth
@@ -679,6 +732,7 @@ export function AIAgents() {
               onKeyDown={(e) => {
                 if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) handleRun();
               }}
+              slotProps={{ input: { readOnly: isOffline } }}
             />
             <Stack direction="row" spacing={1}>
               {isRunning ? (
@@ -721,15 +775,19 @@ export function AIAgents() {
             <Select
               labelId="agent-model-label"
               label="Ollama model"
-              value={model}
+              value={isOffline ? "demo-mode" : model}
               onChange={(e) => setModel(e.target.value)}
-              disabled={modelsLoading || models.length === 0}
+              disabled={isOffline || modelsLoading || models.length === 0}
             >
-              {models.map((m) => (
-                <MenuItem key={m.name} value={m.name}>
-                  {m.name}
-                </MenuItem>
-              ))}
+              {isOffline ? (
+                <MenuItem value="demo-mode">Demo Mode</MenuItem>
+              ) : (
+                models.map((m) => (
+                  <MenuItem key={m.name} value={m.name}>
+                    {m.name}
+                  </MenuItem>
+                ))
+              )}
             </Select>
           </FormControl>
           {modelsLoading && (
@@ -795,6 +853,7 @@ export function AIAgents() {
               setSysDraft(systemPrompt);
               setSysDialogOpen(true);
             }}
+            disabled={isOffline}
           >
             Edit system prompt
           </Button>
