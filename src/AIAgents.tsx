@@ -4,11 +4,23 @@ import {
   Box,
   Button,
   Chip,
+  CircularProgress,
   Divider,
+  FormControl,
+  FormControlLabel,
+  IconButton,
+  InputLabel,
   MenuItem,
   Paper,
+  Select,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
   Stack,
+  Switch,
   TextField,
+  Tooltip,
   Typography,
 } from "@mui/material";
 import PlayArrowRoundedIcon from "@mui/icons-material/PlayArrowRounded";
@@ -17,448 +29,575 @@ import RestartAltRoundedIcon from "@mui/icons-material/RestartAltRounded";
 const DEFAULT_SYSTEM_PROMPT =
   "You are a helpful assistant. Use available tools when needed, be concise, and explain your final answer clearly.";
 
-type LlmId = "gemini" | "chatgpt" | "copilot" | "claude";
-type ToolId =
-  | "web-search"
-  | "calculator"
-  | "file-reader"
-  | "calendar"
-  | "weather-api";
-type StepKind = "user" | "llm" | "tool" | "result" | "answer";
+// Fixed harness loop budget: at most this many think → act → observe rounds per run.
+const MAX_STEPS = 3;
 
-interface LlmOption {
-  id: LlmId;
-  name: string;
-  tagline: string;
+type TraceKind =
+  | "user"
+  | "harness"
+  | "llm"
+  | "tool_call"
+  | "tool_result"
+  | "answer"
+  | "error";
+
+interface TraceStep {
+  kind: TraceKind;
+  title: string;
+  body: string;
+  raw?: string;
 }
 
-interface ToolOption {
-  id: ToolId;
+interface ToolDef {
+  id: string;
   name: string;
   description: string;
-  short: string;
+  schema: Record<string, unknown>;
 }
 
-interface Scenario {
+const TOOL_DEFS: ToolDef[] = [
+  {
+    id: "calculator",
+    name: "calculator",
+    description: "Evaluate arithmetic precisely.",
+    schema: { expression: "string — e.g. \"27*14+8\"" },
+  },
+  {
+    id: "clock",
+    name: "clock",
+    description: "Get the current date and time.",
+    schema: { "(no arguments)": "" },
+  },
+  {
+    id: "read_note",
+    name: "read_note",
+    description: "Read notes.txt / roadmap.txt.",
+    schema: { name: "string — file name, default notes.txt" },
+  },
+  {
+    id: "web_search",
+    name: "web_search",
+    description: "Search the web for current info.",
+    schema: { query: "string — search query" },
+  },
+];
+
+interface Task {
   id: string;
   label: string;
   request: string;
-  preferredTool: ToolId;
 }
 
-interface RunStep {
-  kind: StepKind;
-  title: string;
-  body: string;
-}
-
-const LLM_OPTIONS: LlmOption[] = [
-  { id: "gemini", name: "Gemini", tagline: "Google LLM family" },
-  { id: "chatgpt", name: "ChatGPT", tagline: "OpenAI LLM family" },
-  { id: "copilot", name: "Copilot", tagline: "GitHub coding assistant LLMs" },
-  { id: "claude", name: "Claude", tagline: "Anthropic LLM family" },
-];
-
-const TOOL_OPTIONS: ToolOption[] = [
+const TASKS: Task[] = [
   {
-    id: "web-search",
-    name: "Web Search",
-    description: "Look up current information from the web.",
-    short: "Search",
+    id: "math",
+    label: "Math (needs calculator)",
+    request: "What is 27*14 + 8? Use the calculator tool.",
   },
   {
-    id: "calculator",
-    name: "Calculator",
-    description: "Evaluate arithmetic precisely.",
-    short: "Calc",
+    id: "multistep",
+    label: "Multi-step (clock + calculator)",
+    request:
+      "What day of the week is it today, and what is 96 divided by 12? Use the clock, then the calculator.",
   },
   {
-    id: "file-reader",
-    name: "File Reader",
-    description: "Read external notes or documents.",
-    short: "Files",
+    id: "notes",
+    label: "Notes lookup (needs read_note)",
+    request: "Check notes.txt and tell me what I worked on yesterday.",
   },
   {
-    id: "calendar",
-    name: "Calendar",
-    description: "Check schedule and time slots.",
-    short: "Calendar",
+    id: "news",
+    label: "News (needs web_search)",
+    request:
+      "Search the web for one renewable-energy headline and summarize it in one sentence.",
   },
   {
-    id: "weather-api",
-    name: "Weather API",
-    description: "Fetch forecast data for a location.",
-    short: "Weather",
+    id: "custom",
+    label: "Free chat (type below)",
+    request: "",
   },
 ];
 
-const SCENARIOS: Scenario[] = [
-  {
-    id: "renewable-headline",
-    label: "News lookup",
-    request: "Find one headline about renewable energy and summarize it in one sentence.",
-    preferredTool: "web-search",
-  },
-  {
-    id: "oscars-headline",
-    label: "Entertainment lookup",
-    request: "Find one headline about the Oscars and summarize it in one sentence.",
-    preferredTool: "web-search",
-  },
-  {
-    id: "math-check",
-    label: "Math calculation",
-    request: "Calculate 27 * 14.",
-    preferredTool: "calculator",
-  },
-  {
-    id: "notes-check",
-    label: "Read project notes",
-    request: "Check my notes and tell me what I worked on yesterday.",
-    preferredTool: "file-reader",
-  },
-  {
-    id: "meeting-time",
-    label: "Schedule planning",
-    request: "Find two open meeting times for tomorrow afternoon.",
-    preferredTool: "calendar",
-  },
-  {
-    id: "forecast",
-    label: "Weather check",
-    request: "What is the weather forecast in Seattle this afternoon?",
-    preferredTool: "weather-api",
-  },
-];
-
-function truncate(text: string, maxLen: number): string {
-  if (text.length <= maxLen) return text;
-  return `${text.slice(0, maxLen - 3)}...`;
+interface OllamaModel {
+  name: string;
+  model: string;
+  capabilities?: string[] | null;
+  details?: { parameter_size?: string } | null;
 }
 
-function parseSimpleMathExpression(
-  input: string,
-): { expression: string; result: number } | null {
-  const match = input.match(/(-?\d+(?:\.\d+)?)\s*([+\-*/])\s*(-?\d+(?:\.\d+)?)/);
-  if (!match) return null;
-  const left = Number(match[1]);
-  const op = match[2];
-  const right = Number(match[3]);
-  if (!Number.isFinite(left) || !Number.isFinite(right)) return null;
-
-  let result: number;
-  if (op === "+") result = left + right;
-  else if (op === "-") result = left - right;
-  else if (op === "*") result = left * right;
-  else if (op === "/") result = right === 0 ? Number.NaN : left / right;
-  else return null;
-
-  return { expression: `${left} ${op} ${right}`, result };
+function parameterCount(size: string | undefined): number {
+  if (!size) return Number.POSITIVE_INFINITY;
+  const m = size.trim().match(/^([\d.]+)\s*([KMGT])?/i);
+  if (!m) return Number.POSITIVE_INFINITY;
+  const mult: Record<string, number> = { K: 1e3, M: 1e6, G: 1e9, B: 1e9, T: 1e12 };
+  return Number.parseFloat(m[1]!) * (mult[(m[2] ?? "").toUpperCase()] ?? 1);
 }
 
-function getToolOutput(toolId: ToolId, scenarioId: string, request: string): string {
-  if (toolId === "calculator") {
-    const parsed = parseSimpleMathExpression(request);
-    if (parsed && Number.isFinite(parsed.result)) {
-      return `Computed ${parsed.expression} = ${parsed.result}.`;
-    }
-    return "Computed sample: 27 * 14 = 378.";
-  }
-  if (toolId === "web-search") {
-    if (scenarioId === "renewable-headline") {
-      return 'Top result: "Grid-scale battery deployments rise as solar installations expand."';
-    }
-    if (scenarioId === "oscars-headline") {
-      return 'Top result: "Oscars 2026: Best Picture nominees announced with several first-time directors."';
-    }
-    return 'Top result: "Technology and business coverage highlights this week\'s market shifts."';
-  }
-  if (toolId === "file-reader") {
-    return 'Read file project-notes.txt: "Yesterday: drafted Q2 roadmap and prioritized onboarding fixes."';
-  }
-  if (toolId === "calendar") {
-    return "Calendar check: tomorrow has open slots at 1:00 PM and 3:30 PM.";
-  }
-  return "Weather lookup: Seattle forecast is 58F with light rain in the afternoon.";
-}
-
-function buildRunScript({
-  modelId,
-  systemPrompt,
-  scenario,
-  selectedToolIds,
-}: {
-  modelId: LlmId;
-  systemPrompt: string;
-  scenario: Scenario;
-  selectedToolIds: ToolId[];
-}): RunStep[] {
-  const modelName = LLM_OPTIONS.find((m) => m.id === modelId)?.name ?? "LLM";
-  const promptPreview = truncate(systemPrompt.replace(/\s+/g, " ").trim(), 120);
-
-  const steps: RunStep[] = [
-    { kind: "user", title: "User Request", body: scenario.request },
-    {
-      kind: "llm",
-      title: `${modelName} Reads System Prompt`,
-      body: `Instruction context: "${promptPreview}"`,
-    },
-  ];
-
-  if (!selectedToolIds.includes(scenario.preferredTool)) {
-    const neededTool =
-      TOOL_OPTIONS.find((t) => t.id === scenario.preferredTool)?.name ??
-      scenario.preferredTool;
-    steps.push({
-      kind: "llm",
-      title: "Reasoning (Required Tool Missing)",
-      body: `This scenario expects ${neededTool}, but it is not attached.`,
-    });
-    steps.push({
-      kind: "answer",
-      title: "Final Answer",
-      body: `I cannot reliably complete this request without ${neededTool}. Attach that tool and run again.`,
-    });
-    return steps;
-  }
-
-  const chosenTool = scenario.preferredTool;
-  const toolName = TOOL_OPTIONS.find((t) => t.id === chosenTool)?.name ?? chosenTool;
-  const toolOutput = getToolOutput(chosenTool, scenario.id, scenario.request);
-  steps.push({
-    kind: "tool",
-    title: `Tool Call: ${toolName}`,
-    body: `Input: "${truncate(scenario.request, 90)}"`,
-  });
-  steps.push({
-    kind: "result",
-    title: `${toolName} Result`,
-    body: toolOutput,
-  });
-  steps.push({
-    kind: "answer",
-    title: "Final Answer",
-    body: `Using ${toolName}, the agent returns: ${toolOutput}`,
-  });
-  return steps;
-}
-
-function stepBorderColor(kind: StepKind): string {
+function stepBorderColor(kind: TraceKind): string {
   if (kind === "user") return "#8e24aa";
+  if (kind === "harness") return "#78909c";
   if (kind === "llm") return "#1976d2";
-  if (kind === "tool") return "#ed6c02";
-  if (kind === "result") return "#0288d1";
-  return "#2e7d32";
+  if (kind === "tool_call") return "#ed6c02";
+  if (kind === "tool_result") return "#0288d1";
+  if (kind === "answer") return "#2e7d32";
+  return "#d32f2f";
 }
 
-function VisualAgentCanvas({
-  modelName,
-  selectedToolIds,
-}: {
-  modelName: string;
-  selectedToolIds: ToolId[];
-}) {
-  const selectedTools = TOOL_OPTIONS.filter((tool) =>
-    selectedToolIds.includes(tool.id),
-  );
-  const width = 520;
-  const height = 280;
-  const centerX = 180;
-  const centerY = 140;
-  const llmRadius = 62;
-  const toolX = 390;
-  const top = 42;
-  const spacing = 46;
-
-  return (
-    <svg
-      width="100%"
-      viewBox={`0 0 ${width} ${height}`}
-      style={{ display: "block", borderRadius: 10 }}
-    >
-      <rect
-        x={10}
-        y={10}
-        width={width - 20}
-        height={height - 20}
-        rx={14}
-        fill="transparent"
-        stroke="#90a4ae"
-        strokeOpacity={0.35}
-      />
-
-      <circle
-        cx={centerX}
-        cy={centerY}
-        r={llmRadius}
-        fill="#ffffff"
-        stroke="#1976d2"
-        strokeWidth={2.5}
-      />
-      <text
-        x={centerX}
-        y={centerY - 8}
-        textAnchor="middle"
-        fill="#0d47a1"
-        fontSize={14}
-        fontWeight="bold"
-      >
-        LLM
-      </text>
-      <text
-        x={centerX}
-        y={centerY + 14}
-        textAnchor="middle"
-        fill="#0d47a1"
-        fontSize={13}
-        fontWeight="600"
-      >
-        {modelName}
-      </text>
-
-      {selectedTools.length === 0 ? (
-        <text
-          x={toolX - 90}
-          y={centerY + 5}
-          textAnchor="middle"
-          fill="#607d8b"
-          fontSize={11}
-        >
-          Attach tools to connect nodes
-        </text>
-      ) : (
-        selectedTools.map((tool, idx) => {
-          const toolY = top + idx * spacing;
-          const toolW = 112;
-          const toolH = 28;
-          const toolMidY = toolY + toolH / 2;
-          return (
-            <g key={tool.id}>
-              <line
-                x1={centerX + llmRadius}
-                y1={centerY}
-                x2={toolX}
-                y2={toolMidY}
-                stroke="#26BDC0"
-                strokeWidth={2.2}
-                strokeOpacity={0.95}
-              />
-              <rect
-                x={toolX}
-                y={toolY}
-                width={toolW}
-                height={toolH}
-                rx={14}
-                fill="#ffffff"
-                stroke="#1a9ea1"
-                strokeWidth={1.6}
-              />
-              <text
-                x={toolX + toolW / 2}
-                y={toolMidY + 1}
-                textAnchor="middle"
-                dominantBaseline="central"
-                fill="#0c4a52"
-                fontSize={11}
-                fontWeight="600"
-              >
-                {tool.short}
-              </text>
-            </g>
-          );
-        })
-      )}
-    </svg>
-  );
+function stepLabel(kind: TraceKind): string {
+  if (kind === "user") return "USER";
+  if (kind === "harness") return "HARNESS";
+  if (kind === "llm") return "LLM";
+  if (kind === "tool_call") return "TOOL CALL";
+  if (kind === "tool_result") return "TOOL RESULT";
+  if (kind === "answer") return "ANSWER";
+  return "ERROR";
 }
+
+type ApprovalDecision = "approve" | "deny" | "stop";
+
+interface PendingCall {
+  name: string;
+  argSummary: string;
+  raw: string;
+}
+
+interface AssistantMessage {
+  content?: string;
+  tool_calls?: Array<{
+    function?: { name?: string; arguments?: unknown };
+  }>;
+}
+
+function parseToolArgs(rawArgs: unknown): Record<string, unknown> {
+  try {
+    if (typeof rawArgs === "string") {
+      const parsed: unknown = JSON.parse(rawArgs);
+      if (parsed && typeof parsed === "object") return parsed as Record<string, unknown>;
+      return {};
+    }
+    if (rawArgs && typeof rawArgs === "object")
+      return rawArgs as Record<string, unknown>;
+  } catch {
+    // fall through to empty args
+  }
+  return {};
+}
+
+function summarizeArgs(args: Record<string, unknown>): string {
+  return Object.entries(args)
+    .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+    .join(", ");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function padToMinimum(start: number, minMs: number): Promise<void> {
+  const remainder = minMs - (Date.now() - start);
+  if (remainder > 0) await sleep(remainder);
+}
+
+type RunPhase =
+  | "idle"
+  | "staging"
+  | "thinking"
+  | "awaiting"
+  | "executing"
+  | "relaying"
+  | "dispatching";
 
 export function AIAgents() {
-  const [modelId, setModelId] = useState<LlmId>("copilot");
-  const [selectedTools, setSelectedTools] = useState<Set<ToolId>>(
-    () => new Set<ToolId>(["web-search"]),
-  );
+  const [models, setModels] = useState<OllamaModel[]>([]);
+  const [model, setModel] = useState("");
+  const [modelsLoading, setModelsLoading] = useState(true);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+
+  const [taskId, setTaskId] = useState(TASKS[0]!.id);
+  const [prompt, setPrompt] = useState(TASKS[0]!.request);
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SYSTEM_PROMPT);
-  const [scenarioId, setScenarioId] = useState<string>(SCENARIOS[0]!.id);
-  const [runSteps, setRunSteps] = useState<RunStep[]>([]);
+  const [sysDialogOpen, setSysDialogOpen] = useState(false);
+  const [sysDraft, setSysDraft] = useState(DEFAULT_SYSTEM_PROMPT);
+  const [enabledTools, setEnabledTools] = useState<string[]>([
+    "calculator",
+    "clock",
+    "read_note",
+    "web_search",
+  ]);
+
+  const [trace, setTrace] = useState<TraceStep[]>([]);
   const [isRunning, setIsRunning] = useState(false);
-  const timerIdsRef = useRef<number[]>([]);
+  const [phase, setPhase] = useState<RunPhase>("idle");
+  const [runError, setRunError] = useState<string | null>(null);
 
-  const selectedToolList = useMemo(
-    () => TOOL_OPTIONS.filter((tool) => selectedTools.has(tool.id)),
-    [selectedTools],
-  );
-  const selectedToolIds = useMemo(
-    () => selectedToolList.map((tool) => tool.id),
-    [selectedToolList],
-  );
-  const modelName =
-    LLM_OPTIONS.find((model) => model.id === modelId)?.name ?? "Unknown";
-  const selectedScenario = useMemo(
-    () => SCENARIOS.find((scenario) => scenario.id === scenarioId) ?? SCENARIOS[0]!,
-    [scenarioId],
-  );
+  // Ask-before-run: the harness pauses before each tool execution so
+  // students can inspect what the model proposed. On by default.
+  const [askBefore, setAskBefore] = useState(true);
+  const askBeforeRef = useRef(true);
+  const [pendingCall, setPendingCall] = useState<PendingCall | null>(null);
+  const approvalRef = useRef<((d: ApprovalDecision) => void) | null>(null);
+  const runIdRef = useRef(0);
 
-  const agentConfig = useMemo(
-    () =>
-      JSON.stringify(
-        {
-          model: modelId,
-          tools: selectedToolIds,
-          systemPrompt: systemPrompt.trim(),
-          scenario: selectedScenario.id,
-        },
-        null,
-        2,
-      ),
-    [modelId, selectedToolIds, systemPrompt, selectedScenario.id],
-  );
-
-  const clearTimers = useCallback(() => {
-    for (const timerId of timerIdsRef.current) window.clearTimeout(timerId);
-    timerIdsRef.current = [];
+  // Load chat-capable models (exclude embedding-only), default smallest.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/ollama/tags");
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.error ?? "Failed to list models.");
+        const all: OllamaModel[] = data.models ?? [];
+        const pool = all.filter((m) => {
+          const caps = m.capabilities ?? [];
+          if (caps.length === 0) return true;
+          return !caps.every((c) => c === "embedding");
+        });
+        const list = pool.length > 0 ? pool : all;
+        const smallest = [...list].sort(
+          (a, b) =>
+            parameterCount(a.details?.parameter_size) -
+            parameterCount(b.details?.parameter_size),
+        )[0];
+        if (!cancelled) {
+          setModels(list);
+          setModel(smallest?.name ?? "");
+        }
+      } catch (e) {
+        if (!cancelled)
+          setModelsError(e instanceof Error ? e.message : "Could not reach Ollama.");
+      } finally {
+        if (!cancelled) setModelsLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  useEffect(() => () => clearTimers(), [clearTimers]);
+  useEffect(() => () => {
+    // Invalidate any in-flight run on unmount.
+    runIdRef.current += 1;
+    approvalRef.current?.("stop");
+  }, []);
 
-  const toggleTool = useCallback((toolId: ToolId) => {
-    setSelectedTools((prev) => {
-      const next = new Set(prev);
-      if (next.has(toolId)) next.delete(toolId);
-      else next.add(toolId);
-      return next;
+  const setAskBeforeBoth = useCallback((v: boolean) => {
+    setAskBefore(v);
+    askBeforeRef.current = v;
+  }, []);
+
+  const toggleTool = useCallback((id: string) => {
+    setEnabledTools((prev) =>
+      prev.includes(id) ? prev.filter((t) => t !== id) : [...prev, id],
+    );
+  }, []);
+
+  const handleTaskChange = useCallback((id: string) => {
+    setTaskId(id);
+    const task = TASKS.find((t) => t.id === id);
+    if (task && task.id !== "custom") setPrompt(task.request);
+    if (task?.id === "custom") setPrompt("");
+  }, []);
+
+  const waitForApproval = useCallback(() => {
+    return new Promise<ApprovalDecision>((resolve) => {
+      approvalRef.current = resolve;
     });
   }, []);
 
-  const handleRunAgent = useCallback(() => {
-    clearTimers();
-    setRunSteps([]);
+  const handleRun = useCallback(async () => {
+    if (!model || !prompt.trim() || isRunning) return;
+    const runId = ++runIdRef.current;
+    const alive = () => runIdRef.current === runId;
+    const push = (step: TraceStep) => setTrace((prev) => [...prev, step]);
+
     setIsRunning(true);
+    setPhase("staging");
+    setRunError(null);
+    setPendingCall(null);
+    setTrace([]);
 
-    const script = buildRunScript({
-      modelId,
-      systemPrompt,
-      scenario: selectedScenario,
-      selectedToolIds,
-    });
+    const userPrompt = prompt.trim();
+    const toolIds = [...enabledTools];
+    const steps = MAX_STEPS;
+    const sys = systemPrompt.trim() || DEFAULT_SYSTEM_PROMPT;
 
-    script.forEach((step, index) => {
-      const timerId = window.setTimeout(() => {
-        setRunSteps((prev) => [...prev, step]);
-        if (index === script.length - 1) setIsRunning(false);
-      }, index * 500);
-      timerIdsRef.current.push(timerId);
-    });
-  }, [clearTimers, modelId, selectedScenario, selectedToolIds, systemPrompt]);
+    push({ kind: "user", title: "User request", body: userPrompt });
 
-  const handleResetAgent = useCallback(() => {
-    clearTimers();
+    // Let the HARNESS chip light up for a full second before the prompt goes to the LLM.
+    await sleep(1000);
+    if (!alive()) return;
+
+    try {
+      const messages: Record<string, unknown>[] = [
+        { role: "system", content: sys },
+        { role: "user", content: userPrompt },
+      ];
+      let finalText = "";
+      let stoppedEarly = false;
+
+      for (let step = 0; step < steps; step++) {
+        if (!alive()) return;
+        setPhase("thinking");
+
+        const llmStart = Date.now();
+        const sres = await fetch("/api/ollama/agent/step", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ model, messages, tools: toolIds }),
+        });
+        const sdata = await sres.json();
+        // Pad fast LLM responses so the LLM chip stays lit for at least two seconds.
+        await padToMinimum(llmStart, 2000);
+        if (!alive()) return;
+        if (!sres.ok) throw new Error(sdata?.error ?? "LLM request failed.");
+
+        const message = sdata.message as AssistantMessage;
+        const content = (message?.content ?? "").trim();
+        const toolCalls = message?.tool_calls ?? [];
+        messages.push({
+          role: "assistant",
+          content: message?.content ?? "",
+          ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+        });
+
+        if (toolCalls.length === 0) {
+          if (content) {
+            push({
+              kind: "llm",
+              title: `LLM responds`,
+              body: content.slice(0, 2000),
+              raw: JSON.stringify(message).slice(0, 2000),
+            });
+            finalText = content;
+          } else {
+            push({
+              kind: "error",
+              title: "Empty response",
+              body: "The model returned no text and no tool calls.",
+              raw: JSON.stringify(sdata).slice(0, 1000),
+            });
+          }
+          break;
+        }
+
+        if (content) {
+          push({
+            kind: "llm",
+            title: `LLM thinking`,
+            body: content.slice(0, 2000),
+            raw: JSON.stringify(message).slice(0, 2000),
+          });
+        }
+
+        for (let ci = 0; ci < toolCalls.length; ci++) {
+          const call = toolCalls[ci]!;
+          if (!alive()) return;
+          const name = call?.function?.name ?? "unknown";
+          const args = parseToolArgs(call?.function?.arguments);
+          const argSummary = summarizeArgs(args);
+          push({
+            kind: "tool_call",
+            title: `Tool call proposed: ${name}${argSummary ? ` (${argSummary})` : ""}`,
+            body: `Structured output from the LLM. Nothing has run yet — the harness is holding this proposal until it is approved.`,
+            raw: JSON.stringify(call, null, 2),
+          });
+
+          let decision: ApprovalDecision = "approve";
+          if (askBeforeRef.current) {
+            setPendingCall({
+              name,
+              argSummary,
+              raw: JSON.stringify(call, null, 2),
+            });
+            setPhase("awaiting");
+            decision = await waitForApproval();
+            setPendingCall(null);
+            if (!alive()) return;
+            if (decision === "stop") {
+              stoppedEarly = true;
+              break;
+            }
+            if (decision === "deny") {
+              const msg = `Denied by user — the ${name} tool was NOT executed.`;
+              messages.push({ role: "tool", content: `Error: ${msg}` });
+              continue;
+            }
+          }
+
+          if (!alive()) return;
+          // When auto-approved there is no awaiting pause, so flash the
+          // harness before tools to show the LLM → harness → tools handoff.
+          if (!askBeforeRef.current) {
+            setPhase("dispatching");
+            await sleep(250);
+            if (!alive()) return;
+          }
+          setPhase("executing");
+          // Hold the TOOLS chip lit so the run is visible before the result returns.
+          await sleep(1000);
+          if (!alive()) return;
+          const eres = await fetch("/api/ollama/agent/exec", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name, args, allowedTools: toolIds }),
+          });
+          const edata = await eres.json();
+          if (!alive()) return;
+          if (edata?.output) {
+            const output = String(edata.output);
+            messages.push({ role: "tool", content: output });
+          } else {
+            const errMsg = edata?.error ?? "Tool failed.";
+            messages.push({ role: "tool", content: `Error: ${errMsg}` });
+          }
+          // When one LLM response batches multiple tool calls, hold the LLM
+          // chip between calls as a teaching-aid pause (not technically a new inference).
+          if (ci < toolCalls.length - 1) {
+            if (!alive()) return;
+            setPhase("relaying");
+            await sleep(250);
+            if (!alive()) return;
+            setPhase("thinking");
+            await sleep(2000);
+            if (!alive()) return;
+          }
+        }
+
+        if (stoppedEarly) break;
+        // Show the harness handing the tool result back before the next LLM call.
+        if (toolCalls.length > 0) {
+          if (!alive()) return;
+          setPhase("relaying");
+          await sleep(250);
+          if (!alive()) return;
+        }
+        if (step === steps - 1) {
+          push({
+            kind: "error",
+            title: "Max steps reached",
+            body: `Stopped after ${steps} tool-use rounds. Increase max steps or simplify the task.`,
+          });
+        }
+      }
+
+      if (!alive()) return;
+      if (stoppedEarly) {
+        // Halt silently — partial trace above is preserved.
+      } else if (!finalText) {
+        // One last no-tools call so students still get a grounded summary.
+        setPhase("thinking");
+        try {
+          const summaryStart = Date.now();
+          const sres = await fetch("/api/ollama/agent/step", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model,
+              messages: [
+                ...messages,
+                {
+                  role: "user",
+                  content: "Summarize the tool results above into a concise final answer.",
+                },
+              ],
+              tools: [],
+            }),
+          });
+          const sdata = await sres.json();
+          await padToMinimum(summaryStart, 2000);
+          if (!alive()) return;
+          if (sres.ok && (sdata.message as AssistantMessage)?.content) {
+            finalText = String((sdata.message as AssistantMessage).content);
+            push({ kind: "llm", title: "LLM responds", body: finalText.slice(0, 3000) });
+          }
+        } catch {
+          // Final summarization is best-effort.
+        }
+      }
+    } catch (e) {
+      if (!alive()) return;
+      setRunError(e instanceof Error ? e.message : "Agent run failed.");
+    } finally {
+      if (alive()) {
+        setIsRunning(false);
+        setPhase("idle");
+        setPendingCall(null);
+      }
+    }
+  }, [model, prompt, isRunning, systemPrompt, enabledTools, waitForApproval]);
+
+  const handleStop = useCallback(() => {
+    runIdRef.current += 1;
+    approvalRef.current?.("stop");
+    setPendingCall(null);
     setIsRunning(false);
-    setRunSteps([]);
-    setModelId("copilot");
-    setSelectedTools(new Set<ToolId>(["web-search"]));
+    setPhase("idle");
+  }, []);
+
+  const handleApprove = useCallback(() => {
+    approvalRef.current?.("approve");
+  }, []);
+
+  const handleDeny = useCallback(() => {
+    approvalRef.current?.("deny");
+  }, []);
+
+  const handleApproveAll = useCallback(() => {
+    // Approve this call and skip further prompts for the rest of the run.
+    setAskBeforeBoth(false);
+    approvalRef.current?.("approve");
+  }, [setAskBeforeBoth]);
+
+  const handleReset = useCallback(() => {
+    runIdRef.current += 1;
+    approvalRef.current?.("stop");
+    setPendingCall(null);
+    setIsRunning(false);
+    setPhase("idle");
+    setTrace([]);
+    setRunError(null);
+    setTaskId(TASKS[0]!.id);
+    setPrompt(TASKS[0]!.request);
     setSystemPrompt(DEFAULT_SYSTEM_PROMPT);
-    setScenarioId(SCENARIOS[0]!.id);
-  }, [clearTimers]);
+    setEnabledTools(["calculator", "clock", "read_note", "web_search"]);
+    setAskBeforeBoth(true);
+  }, [setAskBeforeBoth]);
+
+  const activeTool = useMemo(() => {
+    for (let i = trace.length - 1; i >= 0; i--) {
+      if (trace[i]!.kind === "tool_call") {
+        const m = trace[i]!.title.match(/Tool call: (\w+)/);
+        return m?.[1] ?? null;
+      }
+    }
+    return null;
+  }, [trace]);
+
+  const error = modelsError ?? runError;
+  const canRun = model !== "" && prompt.trim() !== "" && !isRunning;
+  const visibleTrace = useMemo(
+    () =>
+      trace.filter(
+        (s) => s.kind !== "harness" && s.kind !== "tool_result" && s.kind !== "answer",
+      ),
+    [trace],
+  );
+
+  const isLLMActive = modelsLoading || (isRunning && phase === "thinking");
+  const isHarnessActive =
+    isRunning &&
+    (phase === "staging" ||
+      phase === "awaiting" ||
+      phase === "relaying" ||
+      phase === "dispatching");
+  const isToolsActive = isRunning && phase === "executing";
+
+  function chipColor(role: string): "primary" | "default" {
+    if (role === "LLM" && isLLMActive) return "primary";
+    if (role === "HARNESS" && isHarnessActive) return "primary";
+    if (role === "TOOLS" && isToolsActive) return "primary";
+    return "default";
+  }
 
   return (
     <Box sx={{ pt: 2, pb: 1, px: 1 }}>
@@ -466,234 +605,426 @@ export function AIAgents() {
         AI Agents
       </Typography>
       <Typography variant="body1" color="text.secondary" sx={{ mb: 1.5 }}>
-        An AI agent is an <strong>LLM + tools + instructions</strong>. This visual
-        builder shows one central LLM node connected to attached tool nodes.
+        An agent is <strong>LLM (brain) + harness (nerves) + tools (hands)</strong>.
+        The LLM only writes text — when it needs facts or math it emits a{" "}
+        <strong>structured tool call</strong>, the harness runs real code, and the
+        result goes back in. 
       </Typography>
 
-      <Box sx={{ display: "flex", gap: 2, alignItems: "stretch" }}>
-        <Paper elevation={2} sx={{ p: 2, borderRadius: 3, flex: "0 0 260px" }}>
-          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
-            Agent Builder
-          </Typography>
-          <Divider sx={{ mb: 1 }} />
+      {error && (
+        <Alert
+          severity="error"
+          sx={{ mb: 2 }}
+          onClose={() => {
+            setModelsError(null);
+            setRunError(null);
+          }}
+        >
+          {error} {error.includes("11434") && "Is `ollama serve` running?"}{" "}
+          {error.toLowerCase().includes("tool") &&
+            "Tip: pull a tool-capable model, e.g. `ollama pull qwen2.5`."}
+        </Alert>
+      )}
 
-          <Typography variant="subtitle2" fontWeight="bold" gutterBottom>
-            1) Choose LLM
-          </Typography>
-          <Stack spacing={0.75} sx={{ mb: 1.5 }}>
-            {LLM_OPTIONS.map((model) => (
-              <Paper
-                key={model.id}
-                elevation={0}
-                onClick={() => setModelId(model.id)}
-                sx={{
-                  p: 1,
-                  borderRadius: 1.5,
-                  cursor: "pointer",
-                  border: 2,
-                  borderColor:
-                    modelId === model.id ? "primary.main" : "divider",
-                  bgcolor: modelId === model.id ? "action.selected" : "transparent",
-                  "&:hover": { bgcolor: "action.hover" },
-                }}
+      <Box sx={{ display: "flex", gap: 2, alignItems: "flex-start", flexWrap: "wrap" }}>
+        {/* ── Left column: ask + setup ── */}
+        <Box
+          sx={{
+            flex: "0 1 300px",
+            minWidth: 270,
+            display: "flex",
+            flexDirection: "column",
+            gap: 2,
+          }}
+        >
+          <Paper elevation={2} sx={{ p: 2, borderRadius: 3 }}>
+            <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
+              Ask
+            </Typography>
+            <Divider sx={{ mb: 1.5 }} />
+            <FormControl fullWidth size="small" sx={{ mb: 1.5 }}>
+              <InputLabel id="task-label">Task</InputLabel>
+              <Select
+                labelId="task-label"
+                label="Task"
+                value={taskId}
+                onChange={(e) => handleTaskChange(e.target.value)}
               >
-                <Typography variant="body2" fontWeight="bold">
-                  {model.name}
-                </Typography>
-                <Typography variant="caption" color="text.secondary">
-                  {model.tagline}
-                </Typography>
-              </Paper>
-            ))}
-          </Stack>
-
-          <Typography variant="subtitle2" fontWeight="bold" gutterBottom>
-            2) Attach Tools (one or many)
-          </Typography>
-          <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.75, mb: 1.5 }}>
-            {TOOL_OPTIONS.map((tool) => {
-              const active = selectedTools.has(tool.id);
-              return (
-                <Chip
-                  key={tool.id}
-                  label={tool.name}
-                  onClick={() => toggleTool(tool.id)}
-                  color={active ? "primary" : "default"}
-                  variant={active ? "filled" : "outlined"}
+                {TASKS.map((t) => (
+                  <MenuItem key={t.id} value={t.id}>
+                    {t.label}
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+            <TextField
+              label="Ask"
+              multiline
+              minRows={3}
+              fullWidth
+              size="small"
+              value={prompt}
+              onChange={(e) => {
+                setPrompt(e.target.value);
+                if (taskId !== "custom") setTaskId("custom");
+              }}
+              sx={{ mb: 1.5 }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) handleRun();
+              }}
+            />
+            <Stack direction="row" spacing={1}>
+              {isRunning ? (
+                <Button variant="contained" color="warning" onClick={handleStop} fullWidth>
+                  Stop
+                </Button>
+              ) : (
+                <Button
+                  variant="contained"
+                  startIcon={<PlayArrowRoundedIcon />}
+                  onClick={handleRun}
+                  disabled={!canRun}
+                  fullWidth
+                >
+                  Run agent
+                </Button>
+              )}
+              <Tooltip title="Reset">
+                <IconButton
                   size="small"
-                  sx={{ fontWeight: active ? "bold" : "normal" }}
-                />
+                  onClick={handleReset}
+                  aria-label="Reset"
+                  sx={{ border: 1, borderColor: "divider", borderRadius: 1.5 }}
+                >
+                  <RestartAltRoundedIcon fontSize="small" />
+                </IconButton>
+              </Tooltip>
+            </Stack>
+          </Paper>
+
+          {/* ── Setup ── */}
+          <Paper elevation={2} sx={{ p: 2, borderRadius: 3 }}>
+          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
+            Agent setup
+          </Typography>
+          <Divider sx={{ mb: 1.5 }} />
+
+          <FormControl fullWidth size="small" sx={{ mb: 1.5 }}>
+            <InputLabel id="agent-model-label">Ollama model</InputLabel>
+            <Select
+              labelId="agent-model-label"
+              label="Ollama model"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              disabled={modelsLoading || models.length === 0}
+            >
+              {models.map((m) => (
+                <MenuItem key={m.name} value={m.name}>
+                  {m.name}
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          {modelsLoading && (
+            <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 1.5 }}>
+              <CircularProgress size={16} />
+              <Typography variant="body2" color="text.secondary">
+                Loading models from Ollama…
+              </Typography>
+            </Box>
+          )}
+
+          <Typography variant="body2" fontWeight="bold" gutterBottom>
+            Tools
+          </Typography>
+          <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.75, mb: 1 }}>
+            {TOOL_DEFS.map((t) => {
+              const on = enabledTools.includes(t.id);
+              return (
+                <Tooltip
+                  key={t.id}
+                  title={
+                    <Box component="pre" sx={{ m: 0, fontSize: 11, whiteSpace: "pre-wrap" }}>
+                      {`${t.name}(${Object.entries(t.schema)
+                        .map(([k, v]) => `${k}: ${v}`)
+                        .join(", ")})\n${t.description}`}
+                    </Box>
+                  }
+                >
+                  <Chip
+                    label={t.name}
+                    onClick={() => toggleTool(t.id)}
+                    color={on ? "primary" : "default"}
+                    variant={on ? "filled" : "outlined"}
+                    size="small"
+                    sx={{ fontWeight: on ? "bold" : "normal" }}
+                  />
+                </Tooltip>
               );
             })}
           </Box>
 
-          <Typography variant="subtitle2" fontWeight="bold" gutterBottom>
-            3) Configure Instructions
-          </Typography>
-          <TextField
-            multiline
-            minRows={4}
-            fullWidth
-            value={systemPrompt}
-            onChange={(event) => setSystemPrompt(event.target.value)}
-            size="small"
-            placeholder="System prompt..."
-            sx={{ mb: 1 }}
+          <FormControlLabel
+            control={
+              <Switch
+                checked={askBefore}
+                onChange={(e) => setAskBeforeBoth(e.target.checked)}
+                size="small"
+              />
+            }
+            label={
+              <Typography variant="body2" fontWeight="bold">
+                Ask Before Tool Calls
+              </Typography>
+            }
+            sx={{ mb: 0.25 }}
           />
-          <TextField
-            select
-            fullWidth
+
+          <Button
+            variant="outlined"
             size="small"
-            label="Scenario"
-            value={scenarioId}
-            onChange={(event) => setScenarioId(event.target.value)}
+            fullWidth
+            onClick={() => {
+              setSysDraft(systemPrompt);
+              setSysDialogOpen(true);
+            }}
           >
-            {SCENARIOS.map((scenario) => (
-              <MenuItem key={scenario.id} value={scenario.id}>
-                {scenario.label}
-              </MenuItem>
-            ))}
-          </TextField>
-          <Typography variant="caption" color="text.secondary" sx={{ mt: 0.75, display: "block" }}>
-            {selectedScenario.request}
-          </Typography>
+            Edit system prompt
+          </Button>
+          <Divider sx={{ my: 1.5 }} />
         </Paper>
+        </Box>
 
-        <Paper elevation={2} sx={{ p: 2, borderRadius: 3, flex: 1 }}>
-          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
-            Visual Agent Graph
-          </Typography>
-          <Divider sx={{ mb: 1 }} />
-          <VisualAgentCanvas modelName={modelName} selectedToolIds={selectedToolIds} />
-
-          <Stack direction="row" spacing={1} sx={{ mt: 1, mb: 1.25 }}>
-            <Button
-              variant="contained"
-              startIcon={<PlayArrowRoundedIcon />}
-              onClick={handleRunAgent}
-              disabled={isRunning}
-              size="small"
+        {/* ── Live trace ── */}
+        <Paper elevation={2} sx={{ p: 2, borderRadius: 3, flex: "1 1 420px", minWidth: 300 }}>
+          <Box
+            sx={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 1,
+              flexWrap: "wrap",
+            }}
+          >
+            <Typography variant="subtitle1" fontWeight="bold">
+              Live Steps
+            </Typography>
+            {/* role strip */}
+            <Box
+              sx={{
+                display: "flex",
+                alignItems: "center",
+                gap: 0.75,
+                flexWrap: "wrap",
+              }}
             >
-              {isRunning ? "Running..." : "Run Agent"}
-            </Button>
-            <Button
-              variant="outlined"
-              startIcon={<RestartAltRoundedIcon />}
-              onClick={handleResetAgent}
-              size="small"
-            >
-              Reset
-            </Button>
-          </Stack>
+              {["LLM", "HARNESS", "TOOLS"].map((role, i) => (
+                <Box key={role} sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
+                  {i > 0 && (
+                    <Typography color="text.secondary" variant="caption">
+                      ⇄
+                    </Typography>
+                  )}
+                  <Chip
+                    label={role}
+                    size="small"
+                    color={chipColor(role)}
+                    variant={chipColor(role) === "primary" ? "filled" : "outlined"}
+                    sx={{ fontWeight: "bold" }}
+                  />
+                </Box>
+              ))}
+              {activeTool && (
+                <Typography variant="caption" color="text.secondary">
+                  last call: {activeTool}
+                </Typography>
+              )}
+            </Box>
+          </Box>
+          <Divider sx={{ mb: 1.5, mt: 1 }} />
 
-          <Divider sx={{ mb: 1 }} />
-          <Typography variant="subtitle2" fontWeight="bold" gutterBottom>
-            Simulated Run Timeline
-          </Typography>
-          {runSteps.length === 0 ? (
-            <Typography variant="body2" color="text.secondary">
-              Choose a scenario and click <strong>Run Agent</strong> to see a deterministic step-by-step simulation.
+          {visibleTrace.length === 0 ? (
+            <Typography variant="body2" color="text.secondary" align="center">
+              Pick a task (or type your own) and click{" "}
+              <strong>Run agent</strong>.
             </Typography>
           ) : (
             <Stack spacing={1}>
-              {runSteps.map((step, index) => (
+              {visibleTrace.map((step, i) => {
+                return (
+                  <Paper
+                    key={i}
+                    elevation={0}
+                    sx={{
+                      p: 1,
+                      borderRadius: 1.5,
+                      borderLeft: 4,
+                      borderColor: stepBorderColor(step.kind),
+                      bgcolor: "action.hover",
+                    }}
+                  >
+                    <Typography variant="caption" fontWeight="bold" color="text.secondary">
+                      {stepLabel(step.kind)}
+                    </Typography>
+                    <Typography variant="body2" fontWeight="bold">
+                      {step.title}
+                    </Typography>
+                    <Typography variant="body2" color="text.secondary" sx={{ whiteSpace: "pre-wrap" }}>
+                      {step.body}
+                    </Typography>
+                  </Paper>
+                );
+              })}
+              {pendingCall && (
                 <Paper
-                  key={`${step.kind}-${index}`}
-                  elevation={0}
+                  elevation={2}
                   sx={{
-                    p: 1,
+                    p: 1.5,
                     borderRadius: 1.5,
-                    borderLeft: 4,
-                    borderColor: stepBorderColor(step.kind),
+                    border: 2,
+                    borderColor: "warning.main",
                     bgcolor: "action.hover",
                   }}
                 >
-                  <Typography variant="body2" fontWeight="bold">
-                    {step.title}
+                  <Typography variant="caption" fontWeight="bold" color="warning.main">
+                    APPROVAL NEEDED
+                  </Typography>
+                  <Typography variant="body2" fontWeight="bold" gutterBottom>
+                    Run {pendingCall.name}
+                    {pendingCall.argSummary ? ` (${pendingCall.argSummary})` : ""}?
                   </Typography>
                   <Typography
+                    component="pre"
                     variant="caption"
-                    color="text.secondary"
-                    sx={{ whiteSpace: "pre-wrap" }}
+                    sx={{
+                      fontFamily: "monospace",
+                      bgcolor: "background.paper",
+                      borderRadius: 1,
+                      p: 1,
+                      m: 0,
+                      mb: 1,
+                      whiteSpace: "pre-wrap",
+                      wordBreak: "break-word",
+                      maxHeight: 180,
+                      overflow: "auto",
+                    }}
                   >
-                    {step.body}
+                    {pendingCall.raw}
                   </Typography>
+                  <Stack direction="row" spacing={1} sx={{ flexWrap: "wrap" }}>
+                    <Button variant="contained" size="small" color="success" onClick={handleApprove}>
+                      Approve
+                    </Button>
+                    <Button variant="outlined" size="small" color="error" onClick={handleDeny}>
+                      Deny
+                    </Button>
+                    <Button size="small" onClick={handleApproveAll}>
+                      Approve all for this run
+                    </Button>
+                  </Stack>
                 </Paper>
-              ))}
+              )}
+              {isRunning && phase === "staging" && (
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1, py: 1 }}>
+                  <CircularProgress size={16} />
+                  <Typography variant="body2" color="text.secondary">
+                    Harness preparing prompt…
+                  </Typography>
+                </Box>
+              )}
+              {isRunning && phase === "thinking" && (
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1, py: 1 }}>
+                  <CircularProgress size={16} />
+                  <Typography variant="body2" color="text.secondary">
+                    Harness waiting on Ollama…
+                  </Typography>
+                </Box>
+              )}
+              {isRunning && phase === "executing" && (
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1, py: 1 }}>
+                  <CircularProgress size={16} />
+                  <Typography variant="body2" color="text.secondary">
+                    Harness running tool…
+                  </Typography>
+                </Box>
+              )}
+              {isRunning && phase === "relaying" && (
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1, py: 1 }}>
+                  <CircularProgress size={16} />
+                  <Typography variant="body2" color="text.secondary">
+                    Harness passing result to LLM…
+                  </Typography>
+                </Box>
+              )}
+              {isRunning && phase === "dispatching" && (
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1, py: 1 }}>
+                  <CircularProgress size={16} />
+                  <Typography variant="body2" color="text.secondary">
+                    Harness passing to tool…
+                  </Typography>
+                </Box>
+              )}
+              {isRunning && phase === "awaiting" && !pendingCall && (
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1, py: 1 }}>
+                  <CircularProgress size={16} />
+                  <Typography variant="body2" color="text.secondary">
+                    Harness paused — waiting…
+                  </Typography>
+                </Box>
+              )}
             </Stack>
           )}
         </Paper>
 
-        <Paper elevation={2} sx={{ p: 2, borderRadius: 3, flex: "0 0 245px" }}>
-          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
-            Built Agent
-          </Typography>
-          <Divider sx={{ mb: 1 }} />
+      </Box>
 
-          <Typography variant="body2" color="text.secondary">
-            Model
+      {/* ── System prompt dialog ── */}
+      <Dialog
+        open={sysDialogOpen}
+        onClose={() => setSysDialogOpen(false)}
+        fullWidth
+        maxWidth="sm"
+      >
+        <DialogTitle>System prompt</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+            Instructions sent to the LLM on every run, before the user request.
           </Typography>
-          <Typography variant="body1" fontWeight="bold" sx={{ mb: 1 }}>
-            {modelName}
-          </Typography>
-
-          <Typography variant="body2" color="text.secondary">
-            Attached Tools
-          </Typography>
-          <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, mb: 1 }}>
-            {selectedToolList.length > 0 ? (
-              selectedToolList.map((tool) => (
-                <Chip
-                  key={`summary-${tool.id}`}
-                  label={tool.name}
-                  size="small"
-                  color="primary"
-                  variant="outlined"
-                />
-              ))
-            ) : (
-              <Typography variant="caption" color="text.secondary">
-                None
-              </Typography>
-            )}
-          </Box>
-
-          {selectedToolList.length === 0 && (
-            <Alert severity="warning" sx={{ mb: 1, py: 0 }}>
-              No tools selected. This behaves like standard LLM chat.
-            </Alert>
-          )}
-
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 0.5 }}>
-            Scenario Requires
-          </Typography>
-          <Typography variant="caption" sx={{ display: "block", mb: 1 }}>
-            {
-              TOOL_OPTIONS.find((tool) => tool.id === selectedScenario.preferredTool)
-                ?.name
-            }
-          </Typography>
-
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 0.5 }}>
-            Configuration
-          </Typography>
-          <Typography
-            component="pre"
-            variant="caption"
-            sx={{
-              fontFamily: "monospace",
-              bgcolor: "action.hover",
-              borderRadius: 1,
-              p: 1,
-              m: 0,
-              whiteSpace: "pre-wrap",
-              wordBreak: "break-word",
+          <TextField
+            multiline
+            minRows={5}
+            fullWidth
+            size="small"
+            value={sysDraft}
+            onChange={(e) => setSysDraft(e.target.value)}
+            autoFocus
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button
+            size="small"
+            onClick={() => {
+              setSysDraft(DEFAULT_SYSTEM_PROMPT);
             }}
           >
-            {agentConfig}
-          </Typography>
-        </Paper>
-      </Box>
+            Restore default
+          </Button>
+          <Box sx={{ flexGrow: 1 }} />
+          <Button size="small" onClick={() => setSysDialogOpen(false)}>
+            Cancel
+          </Button>
+          <Button
+            size="small"
+            variant="contained"
+            onClick={() => {
+              setSystemPrompt(sysDraft);
+              setSysDialogOpen(false);
+            }}
+          >
+            Save
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }
