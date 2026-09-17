@@ -21,10 +21,10 @@ import { AIAgents } from "./AIAgents";
 import "./index.css";
 
 const TABS = [
-  { label: "Neural Networks",  component: <NeuralNetworks /> },
-  { label: "Text Generation",  component: <TextGeneration /> },
-  { label: "VECTOR EMBEDDINGS", component: <VectorEmbeddings /> },
-  { label: "AI Agents", component: <AIAgents /> },
+  { label: "Neural Networks", node: <NeuralNetworks /> },
+  { label: "Text Generation", node: <TextGeneration /> },
+  { label: "VECTOR EMBEDDINGS", node: <VectorEmbeddings /> },
+  { label: "AI Agents", node: <AIAgents /> },
 ];
 
 export function App() {
@@ -74,7 +74,11 @@ export function App() {
 
       <Box sx={{ bgcolor: "background.default" }}>
         <Container maxWidth="lg">
-          {TABS[tab].component}
+          {TABS.map((t, i) => (
+            <Box key={t.label} hidden={tab !== i}>
+              {t.node}
+            </Box>
+          ))}
         </Container>
       </Box>
     </ThemeProvider>

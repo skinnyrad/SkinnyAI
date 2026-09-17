@@ -34,6 +34,26 @@ const DEFAULT_SENTENCES = [
   "Quantum computers use qubits to perform calculations",
 ];
 
+const SENTENCE_STORAGE_KEY = "skinnyai.sentences.v1";
+
+function loadStoredSentenceTexts(): string[] | null {
+  try {
+    const raw = localStorage.getItem(SENTENCE_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    const texts = Array.isArray(parsed) ? parsed : (parsed as { texts?: unknown })?.texts;
+    if (!Array.isArray(texts)) return null;
+    const clean = texts
+      .filter((t): t is string => typeof t === "string")
+      .map((t) => t.trim().slice(0, 500))
+      .filter((t) => t.length > 0)
+      .slice(0, MAX_SENTENCES);
+    return clean.length > 0 ? clean : null;
+  } catch {
+    return null;
+  }
+}
+
 interface OllamaModel {
   name: string;
   model: string;
@@ -227,9 +247,12 @@ function ScatterChart({
 // ─── Main Component ─────────────────────────────────────────
 
 export function VectorEmbeddings() {
-  const nextId = useRef(DEFAULT_SENTENCES.length);
+  const [initialTexts] = useState<string[]>(
+    () => loadStoredSentenceTexts() ?? DEFAULT_SENTENCES,
+  );
+  const nextId = useRef(initialTexts.length);
   const [sentences, setSentences] = useState<Sentence[]>(() =>
-    DEFAULT_SENTENCES.map((text, i) => ({
+    initialTexts.map((text, i) => ({
       id: i,
       text,
       color: COLORS[i % COLORS.length]!,
@@ -246,6 +269,27 @@ export function VectorEmbeddings() {
   const [embedError, setEmbedError] = useState<string | null>(null);
   const [isEmbedding, setIsEmbedding] = useState(false);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
+
+  // Persist sentence texts across tab switches (keep-alive) and browser
+  // reloads. Vectors are NOT stored: they are re-resolved via the bundled
+  // nomic cache / Ollama embed flow so they never go stale per model.
+  // Also syncs texts to the server so the get_embedding_sentences agent
+  // tool always sees the current tab contents.
+  useEffect(() => {
+    const texts = sentences.map((s) => s.text);
+    try {
+      localStorage.setItem(SENTENCE_STORAGE_KEY, JSON.stringify(texts));
+    } catch {
+      // Storage full or unavailable — sentences still persist for tab switches.
+    }
+    fetch("/api/embeddings/sentences", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sentences: texts }),
+    }).catch(() => {
+      // Server unreachable — agent tool falls back to defaults.
+    });
+  }, [sentences]);
 
   // Load embedding-capable models, default to the smallest one.
   useEffect(() => {

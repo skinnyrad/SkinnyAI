@@ -65,7 +65,13 @@ const TOOL_DEFS: ToolDef[] = [
   {
     id: "clock",
     name: "clock",
-    description: "Get the current date and time.",
+    description: "Get the current time of day.",
+    schema: { "(no arguments)": "" },
+  },
+  {
+    id: "calendar",
+    name: "calendar",
+    description: "Get today's date and day of the week.",
     schema: { "(no arguments)": "" },
   },
   {
@@ -75,10 +81,10 @@ const TOOL_DEFS: ToolDef[] = [
     schema: { name: "string — file name, default notes.txt" },
   },
   {
-    id: "web_search",
-    name: "web_search",
-    description: "Search the web for current info.",
-    schema: { query: "string — search query" },
+    id: "get_embedding_sentences",
+    name: "get_embedding_sentences",
+    description: "Get the current Vector Embeddings tab sentences.",
+    schema: { "(no arguments)": "" },
   },
 ];
 
@@ -96,9 +102,9 @@ const TASKS: Task[] = [
   },
   {
     id: "multistep",
-    label: "Multi-step (clock + calculator)",
+    label: "Multi-step (calendar + calculator)",
     request:
-      "What day of the week is it today, and what is 96 divided by 12? Use the clock, then the calculator.",
+      "What day of the week is it today, and what is 96 divided by 12? Use calendar, then the calculator.",
   },
   {
     id: "notes",
@@ -106,10 +112,10 @@ const TASKS: Task[] = [
     request: "Check notes.txt and tell me what I worked on yesterday.",
   },
   {
-    id: "news",
-    label: "News (needs web_search)",
+    id: "embeddings",
+    label: "Embeddings (needs get_embedding_sentences)",
     request:
-      "Search the web for one renewable-energy headline and summarize it in one sentence.",
+      "What sentences are currently on the Vector Embeddings tab? Use get_embedding_sentences and list them.",
   },
   {
     id: "custom",
@@ -221,8 +227,9 @@ export function AIAgents() {
   const [enabledTools, setEnabledTools] = useState<string[]>([
     "calculator",
     "clock",
+    "calendar",
     "read_note",
-    "web_search",
+    "get_embedding_sentences",
   ]);
 
   const [trace, setTrace] = useState<TraceStep[]>([]);
@@ -559,7 +566,7 @@ export function AIAgents() {
     setTaskId(TASKS[0]!.id);
     setPrompt(TASKS[0]!.request);
     setSystemPrompt(DEFAULT_SYSTEM_PROMPT);
-    setEnabledTools(["calculator", "clock", "read_note", "web_search"]);
+    setEnabledTools(["calculator", "clock", "calendar", "read_note", "get_embedding_sentences"]);
     setAskBeforeBoth(true);
   }, [setAskBeforeBoth]);
 

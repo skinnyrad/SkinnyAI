@@ -34,7 +34,14 @@ const AGENT_TOOL_DEFS: AgentToolDef[] = [
     id: "clock",
     name: "clock",
     description:
-      "Get the current date and time. Use when the user asks about today, tomorrow, day of week, etc.",
+      "Get the current time of day (hours, minutes, seconds, timezone). Use when the user asks about the time. For dates or days of the week, use calendar instead.",
+    parameters: { type: "object", properties: {} },
+  },
+  {
+    id: "calendar",
+    name: "calendar",
+    description:
+      "Get today's date and day of the week (e.g. Thursday, September 18, 2026). Use when the user asks about today, tomorrow, dates, or days of the week. For the time of day, use clock instead.",
     parameters: { type: "object", properties: {} },
   },
   {
@@ -53,17 +60,11 @@ const AGENT_TOOL_DEFS: AgentToolDef[] = [
     },
   },
   {
-    id: "web_search",
-    name: "web_search",
+    id: "get_embedding_sentences",
+    name: "get_embedding_sentences",
     description:
-      "Search the web for current information like headlines or facts. Use when the user asks about news or anything beyond training data.",
-    parameters: {
-      type: "object",
-      properties: {
-        query: { type: "string", description: "Search query, e.g. 'renewable energy headline'." },
-      },
-      required: ["query"],
-    },
+      "Get the current sentences on the Vector Embeddings tab. The tab syncs its sentence list here whenever it changes. Use when the user asks what sentences are being embedded or compared.",
+    parameters: { type: "object", properties: {} },
   },
 ];
 
@@ -89,6 +90,19 @@ function safeCalculate(expression: string): string {
   return `${expr} = ${result}`;
 }
 
+const DEFAULT_EMBEDDING_SENTENCES = [
+  "The cat sat on the mat",
+  "A kitten curled up on the couch",
+  "My cat loves to chase yarn",
+  "Quantum computers use qubits to perform calculations",
+];
+
+// Live sentences synced from the Vector Embeddings tab via
+// POST /api/embeddings/sentences. Falls back to defaults until the
+// tab has synced at least once.
+let syncedEmbeddingSentences: string[] = [...DEFAULT_EMBEDDING_SENTENCES];
+let embeddingSentencesSyncedAt: number | null = null;
+
 async function executeAgentTool(
   name: string,
   args: Record<string, unknown>,
@@ -100,40 +114,39 @@ async function executeAgentTool(
   }
   if (name === "clock") {
     const now = new Date();
-    return `Current date/time: ${now.toString()}. Day: ${now.toLocaleDateString("en-US", { weekday: "long" })}.`;
+    const time = now.toLocaleTimeString("en-US", {
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      timeZoneName: "short",
+    });
+    return `Current time: ${time} (server local).`;
+  }
+  if (name === "calendar") {
+    const now = new Date();
+    const date = now.toLocaleDateString("en-US", {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+    });
+    const iso = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    return `Today is ${date} (${iso}, server local).`;
   }
   if (name === "read_note") {
     const key = String(args.name ?? "notes.txt").trim() || "notes.txt";
     const content = BUNDLED_NOTES[key] ?? BUNDLED_NOTES["notes.txt"];
     return `Read file ${key}: "${content}"`;
   }
-  if (name === "web_search") {
-    const query = String(args.query ?? "").trim().slice(0, 200) || "technology news";
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 8000);
-      const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-      const res = await fetch(url, {
-        signal: controller.signal,
-        headers: { "User-Agent": "SkinnyAI-classroom-demo" },
-      });
-      clearTimeout(timer);
-      if (!res.ok) throw new Error(`status ${res.status}`);
-      const data = (await res.json()) as {
-        AbstractText?: string;
-        RelatedTopics?: Array<{ Text?: string }>;
-      };
-      const abstract = (data.AbstractText ?? "").trim();
-      if (abstract) return `Web search "${query}": ${abstract.slice(0, 300)}.`;
-      const related = (data.RelatedTopics ?? [])
-        .map((t) => (t.Text ?? "").trim())
-        .find((t) => t.length > 0);
-      if (related) return `Web search "${query}": ${related.slice(0, 300)}.`;
-      throw new Error("no results");
-    } catch {
-      // Offline-safe fallback so classroom demos never break.
-      return `Web search "${query}" (offline fallback): Top result: "Grid-scale battery deployments rise as solar installations expand."`;
-    }
+  if (name === "get_embedding_sentences") {
+    const list = syncedEmbeddingSentences
+      .map((t, i) => `${i + 1}. "${t}"`)
+      .join("\n");
+    const source =
+      embeddingSentencesSyncedAt === null
+        ? "defaults (tab has not synced yet)"
+        : `live tab contents (synced ${new Date(embeddingSentencesSyncedAt).toISOString()})`;
+    return `Vector Embeddings tab sentences (${source}):\n${list}`.slice(0, 2000);
   }
   throw new Error(`Unknown tool: ${name}`);
 }
@@ -156,6 +169,39 @@ const server = serve({
   routes: {
     // Serve index.html for all unmatched routes.
     "/*": index,
+
+    "/api/embeddings/sentences": {
+      async GET() {
+        return Response.json({
+          sentences: syncedEmbeddingSentences,
+          syncedAt: embeddingSentencesSyncedAt,
+        });
+      },
+      async POST(req) {
+        try {
+          const body = (await req.json()) as { sentences?: unknown };
+          if (!Array.isArray(body.sentences)) {
+            return Response.json(
+              { error: "Missing required field: sentences (array of strings)." },
+              { status: 400 },
+            );
+          }
+          const clean = body.sentences
+            .filter((t): t is string => typeof t === "string")
+            .map((t) => t.trim().slice(0, 500))
+            .filter((t) => t.length > 0)
+            .slice(0, 5);
+          syncedEmbeddingSentences = clean.length > 0 ? clean : [...DEFAULT_EMBEDDING_SENTENCES];
+          embeddingSentencesSyncedAt = Date.now();
+          return Response.json({
+            sentences: syncedEmbeddingSentences,
+            syncedAt: embeddingSentencesSyncedAt,
+          });
+        } catch {
+          return Response.json({ error: "Invalid JSON body." }, { status: 400 });
+        }
+      },
+    },
 
     "/api/ollama/tags": {
       async GET() {
@@ -536,7 +582,7 @@ const server = serve({
       },
     },
     "/api/ollama/agent/exec": {
-      // Execute one approved tool call server-side (web_search needs network).
+      // Execute one approved tool call server-side.
       async POST(req) {
         try {
           const body = (await req.json()) as {
