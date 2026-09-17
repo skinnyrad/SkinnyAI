@@ -16,6 +16,8 @@ import {
   Tooltip,
   CircularProgress,
   useTheme,
+  ToggleButtonGroup,
+  ToggleButton,
 } from "@mui/material";
 import DeleteRoundedIcon from "@mui/icons-material/DeleteRounded";
 import AddRoundedIcon from "@mui/icons-material/AddRounded";
@@ -147,6 +149,49 @@ function pca2D(embeddings: number[][]): { x: number; y: number }[] {
   return pts.map((p) => ({ x: p.x * scale, y: p.y * scale }));
 }
 
+function pca3D(embeddings: number[][]): { x: number; y: number; z: number }[] {
+  const n = embeddings.length;
+  if (n === 0) return [];
+  if (n === 1) return [{ x: 0, y: 0, z: 0 }];
+  if (n === 2) {
+    const pts2 = pca2D(embeddings);
+    return pts2.map((p) => ({ x: p.x, y: p.y, z: 0 }));
+  }
+  const d = embeddings[0]!.length;
+
+  const mean = new Array<number>(d).fill(0);
+  for (const e of embeddings) for (let j = 0; j < d; j++) mean[j]! += e[j]! / n;
+  const xc = embeddings.map((e) => e.map((x, j) => x - mean[j]!));
+
+  const G = xc.map((a) => xc.map((b) => a.reduce((s, x, j) => s + x * b[j]!, 0)));
+
+  const first = powerIteration(G);
+  const deflated2 = G.map((row, i) =>
+    row.map((x, j) => x - first.value * first.vector[i]! * first.vector[j]!),
+  );
+  const second = powerIteration(deflated2);
+  const deflated3 = deflated2.map((row, i) =>
+    row.map((x, j) => x - second.value * second.vector[i]! * second.vector[j]!),
+  );
+  const third = powerIteration(deflated3);
+
+  const s1 = Math.sqrt(Math.max(first.value, 0));
+  const s2 = Math.sqrt(Math.max(second.value, 0));
+  const s3 = Math.sqrt(Math.max(third.value, 0));
+  const pts = xc.map((_, i) => ({
+    x: s1 * first.vector[i]!,
+    y: s2 * second.vector[i]!,
+    z: s3 * third.vector[i]!,
+  }));
+
+  const maxAbs = Math.max(
+    ...pts.flatMap((p) => [Math.abs(p.x), Math.abs(p.y), Math.abs(p.z)]),
+    1e-12,
+  );
+  const scale = 80 / maxAbs;
+  return pts.map((p) => ({ x: p.x * scale, y: p.y * scale, z: p.z * scale }));
+}
+
 function cosineSim(a: number[], b: number[]): number {
   let dot = 0,
     nA = 0,
@@ -244,6 +289,253 @@ function ScatterChart({
   );
 }
 
+// ─── Scatter Chart 3D (pseudo-3D SVG with drag-to-rotate) ──
+
+function ScatterChart3D({
+  sentences,
+  points,
+  selectedIds,
+  onToggle,
+}: {
+  sentences: Sentence[];
+  points: { x: number; y: number; z: number }[];
+  selectedIds: number[];
+  onToggle: (id: number) => void;
+}) {
+  const theme = useTheme();
+  const [rotX, setRotX] = useState(-0.5);
+  const [rotY, setRotY] = useState(0.6);
+  const dragRef = useRef<{ x: number; y: number } | null>(null);
+
+  const project = useCallback(
+    (p: { x: number; y: number; z: number }) => {
+      const cosY = Math.cos(rotY);
+      const sinY = Math.sin(rotY);
+      const cosX = Math.cos(rotX);
+      const sinX = Math.sin(rotX);
+      const x1 = p.x * cosY + p.z * sinY;
+      const z1 = -p.x * sinY + p.z * cosY;
+      const y1 = p.y * cosX - z1 * sinX;
+      const z2 = p.y * sinX + z1 * cosX;
+      const focal = 320;
+      const scale = focal / (focal - z2);
+      return { sx: x1 * scale, sy: y1 * scale, depth: z2, scale };
+    },
+    [rotX, rotY],
+  );
+
+  const projected = useMemo(
+    () =>
+      sentences.map((s, i) => {
+        const raw = points[i] ?? { x: 0, y: 0, z: 0 };
+        const pr = project(raw);
+        return { s, i, raw, ...pr };
+      }),
+    [sentences, points, project],
+  );
+  const sorted = useMemo(
+    () => [...projected].sort((a, b) => a.depth - b.depth),
+    [projected],
+  );
+
+  const line3 = (
+    a: { x: number; y: number; z: number },
+    b: { x: number; y: number; z: number },
+  ) => {
+    const pa = project(a);
+    const pb = project(b);
+    return { x1: pa.sx, y1: pa.sy, x2: pb.sx, y2: pb.sy };
+  };
+  const axis = (end: { x: number; y: number; z: number }) =>
+    line3({ x: 0, y: 0, z: 0 }, end);
+  const axX = axis({ x: 100, y: 0, z: 0 });
+  const axY = axis({ x: 0, y: 100, z: 0 });
+  const axZ = axis({ x: 0, y: 0, z: 100 });
+  const axXLabel = project({ x: 108, y: 0, z: 0 });
+  const axYLabel = project({ x: 0, y: 108, z: 0 });
+  const axZLabel = project({ x: 0, y: 0, z: 108 });
+
+  // Eye references: bounding cube (±100) + floor grid on the bottom
+  // face (y = +B, at the far end of the PC2 axis).
+  const B = 100;
+  const corners = useMemo(
+    () =>
+      [
+        { x: -B, y: -B, z: -B },
+        { x: B, y: -B, z: -B },
+        { x: B, y: B, z: -B },
+        { x: -B, y: B, z: -B },
+        { x: -B, y: -B, z: B },
+        { x: B, y: -B, z: B },
+        { x: B, y: B, z: B },
+        { x: -B, y: B, z: B },
+      ] as { x: number; y: number; z: number }[],
+    [],
+  );
+  const cubeEdges: [number, number][] = [
+    [0, 1], [1, 2], [2, 3], [3, 0], // z = -B square
+    [4, 5], [5, 6], [6, 7], [7, 4], // z = +B square
+    [0, 4], [1, 5], [2, 6], [3, 7], // pillars (edges 10, 11 meet the bottom face)
+  ];
+  const gridSteps = [-60, -20, 20, 60];
+  const isDark = theme.palette.mode === "dark";
+
+  return (
+    <Box>
+      <svg
+        viewBox="-110 -110 220 220"
+        width="100%"
+        style={{ display: "block", maxHeight: 460, touchAction: "none", cursor: "grab" }}
+        onPointerDown={(e) => {
+          (e.target as Element).setPointerCapture?.(e.pointerId);
+          dragRef.current = { x: e.clientX, y: e.clientY };
+        }}
+        onPointerMove={(e) => {
+          const last = dragRef.current;
+          if (!last) return;
+          const dx = e.clientX - last.x;
+          const dy = e.clientY - last.y;
+          dragRef.current = { x: e.clientX, y: e.clientY };
+          setRotY((r) => r + dx * 0.01);
+          setRotX((r) => Math.max(-1.3, Math.min(1.3, r + dy * 0.01)));
+        }}
+        onPointerUp={() => {
+          dragRef.current = null;
+        }}
+        onPointerLeave={() => {
+          dragRef.current = null;
+        }}
+        onDoubleClick={() => {
+          setRotX(-0.5);
+          setRotY(0.6);
+        }}
+      >
+        <defs>
+          <radialGradient id="map3d-bg" cx="50%" cy="42%" r="75%">
+            <stop
+              offset="0%"
+              stopColor={isDark ? "#26BDC0" : "#26BDC0"}
+              stopOpacity={isDark ? 0.14 : 0.1}
+            />
+            <stop
+              offset="100%"
+              stopColor={isDark ? "#000000" : "#ffffff"}
+              stopOpacity={0}
+            />
+          </radialGradient>
+        </defs>
+        <rect x={-110} y={-110} width={220} height={220} rx={10} fill="url(#map3d-bg)" />
+        {/* floor grid on the bottom face (y = +B) */}
+        {gridSteps.map((g) => {
+          const h = line3({ x: g, y: B, z: -B }, { x: g, y: B, z: B });
+          const v = line3({ x: -B, y: B, z: g }, { x: B, y: B, z: g });
+          return (
+            <g key={g}>
+              <line {...h} stroke={theme.palette.divider} strokeWidth={0.5} opacity={0.9} />
+              <line {...v} stroke={theme.palette.divider} strokeWidth={0.5} opacity={0.9} />
+            </g>
+          );
+        })}
+        {/* bounding cube (bottom face y = +B drawn stronger) */}
+        {cubeEdges.map(([a, b], k) => {
+          const isBottom = k === 2 || k === 6 || k === 10 || k === 11;
+          return (
+            <line
+              key={k}
+              {...line3(corners[a]!, corners[b]!)}
+              stroke={theme.palette.divider}
+              strokeWidth={isBottom ? 1 : 0.6}
+              opacity={isBottom ? 1 : 0.7}
+            />
+          );
+        })}
+        <line {...axX} stroke="#D9A400" strokeWidth={1.5} />
+        <line {...axY} stroke={theme.palette.text.primary} strokeWidth={1.5} />
+        <line {...axZ} stroke="#90A4AE" strokeWidth={1.5} />
+        <text x={axXLabel.sx - 8} y={axXLabel.sy + 10} fill="#D9A400" fontSize={7} fontWeight={700}>
+          PC1 →
+        </text>
+        <text x={axYLabel.sx + 4} y={axYLabel.sy} fill={theme.palette.text.primary} fontSize={7} fontWeight={700}>
+          PC2 ↓
+        </text>
+        <text x={axZLabel.sx + 3} y={axZLabel.sy} fill="#90A4AE" fontSize={7} fontWeight={700}>
+          PC3
+        </text>
+        {(() => {
+          const o = project({ x: 0, y: 0, z: 0 });
+          return (
+            <circle
+              cx={o.sx}
+              cy={o.sy}
+              r={3}
+              fill="none"
+              stroke={theme.palette.text.secondary}
+              strokeWidth={1.25}
+              opacity={0.9}
+            />
+          );
+        })()}
+        {sorted.map(({ s, i, sx, sy, scale }) => {
+          const selected = selectedIds.includes(s.id);
+          const r = Math.max(6, Math.min(13, 10 * scale));
+          const dimmed = selectedIds.length > 0 && !selected;
+          const o = project({ x: 0, y: 0, z: 0 });
+          return (
+            <g key={s.id} onClick={() => onToggle(s.id)} style={{ cursor: "pointer" }}>
+              <title>{s.text}</title>
+              {/* spoke to the origin: anchors each point in 3D space */}
+              <line
+                x1={o.sx}
+                y1={o.sy}
+                x2={sx}
+                y2={sy}
+                stroke={s.color}
+                strokeWidth={1.25}
+                strokeDasharray="3 2"
+                opacity={dimmed ? 0.35 : 0.7}
+              />
+              {selected && (
+                <circle
+                  cx={sx}
+                  cy={sy}
+                  r={r + 3}
+                  fill="none"
+                  stroke={theme.palette.text.primary}
+                  strokeWidth={1.5}
+                  strokeDasharray="4 2"
+                />
+              )}
+              <circle
+                cx={sx}
+                cy={sy}
+                r={r}
+                fill={s.color}
+                opacity={dimmed ? 0.55 : 0.95}
+                stroke={theme.palette.background.paper}
+                strokeWidth={2}
+              />
+              <text
+                x={sx}
+                y={sy + 3.5}
+                fill="#fff"
+                fontSize={9}
+                fontWeight={700}
+                textAnchor="middle"
+                pointerEvents="none"
+              >
+                {i + 1}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+      <Typography variant="caption" color="text.secondary" sx={{ display: "block", textAlign: "center" }}>
+        Drag to rotate · double-click to reset
+      </Typography>
+    </Box>
+  );
+}
+
 // ─── Main Component ─────────────────────────────────────────
 
 export function VectorEmbeddings() {
@@ -269,6 +561,7 @@ export function VectorEmbeddings() {
   const [embedError, setEmbedError] = useState<string | null>(null);
   const [isEmbedding, setIsEmbedding] = useState(false);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const [viewMode, setViewMode] = useState<"2d" | "3d">("2d");
 
   // Persist sentence texts across tab switches (keep-alive) and browser
   // reloads. Vectors are NOT stored: they are re-resolved via the bundled
@@ -395,6 +688,11 @@ export function VectorEmbeddings() {
     [embedded],
   );
 
+  const points3D = useMemo(
+    () => pca3D(embedded.map((s) => s.embedding!)),
+    [embedded],
+  );
+
   const similarities = useMemo(() => {
     const pair = selectedIds
       .map((id) => embedded.find((s) => s.id === id) ?? null)
@@ -474,7 +772,7 @@ export function VectorEmbeddings() {
           )}
           {dimCount > 0 && (
             <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-              {dimCount}-dim vectors → 2D via PCA
+              {dimCount}-dim vectors → {viewMode === "2d" ? "2D" : "3D"} via PCA
             </Typography>
           )}
           <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
@@ -554,12 +852,30 @@ export function VectorEmbeddings() {
           </Box>
         </Paper>
 
-        {/* ── Right: 2D chart ── */}
+        {/* ── Right: chart ── */}
         <Paper elevation={2} sx={{ p: 2, borderRadius: 3, flex: "2 1 340px" }}>
-          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
-            Semantic map (2D projection)
-          </Typography>
-          <Divider sx={{ mb: 1.5 }} />
+          <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 1 }}>
+            <Typography variant="subtitle1" fontWeight="bold" gutterBottom sx={{ mb: 0 }}>
+              Semantic Map
+            </Typography>
+            <ToggleButtonGroup
+              value={viewMode}
+              exclusive
+              size="small"
+              onChange={(_, v) => {
+                if (v === "2d" || v === "3d") setViewMode(v);
+              }}
+              aria-label="Map dimension"
+            >
+              <ToggleButton value="2d" aria-label="2D view">
+                2D
+              </ToggleButton>
+              <ToggleButton value="3d" aria-label="3D view">
+                3D
+              </ToggleButton>
+            </ToggleButtonGroup>
+          </Box>
+          <Divider sx={{ mt: 1, mb: 1.5 }} />
           {isEmbedding && embedded.length === 0 ? (
             <Box sx={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: 300 }}>
               <Stack alignItems="center" spacing={1}>
@@ -577,12 +893,21 @@ export function VectorEmbeddings() {
             </Box>
           ) : (
             <>
-              <ScatterChart
-                sentences={embedded}
-                points={points}
-                selectedIds={selectedIds}
-                onToggle={handleTogglePoint}
-              />
+              {viewMode === "2d" ? (
+                <ScatterChart
+                  sentences={embedded}
+                  points={points}
+                  selectedIds={selectedIds}
+                  onToggle={handleTogglePoint}
+                />
+              ) : (
+                <ScatterChart3D
+                  sentences={embedded}
+                  points={points3D}
+                  selectedIds={selectedIds}
+                  onToggle={handleTogglePoint}
+                />
+              )}
               <Divider sx={{ my: 1.5 }} />
               {similarities ? (
                 <Box sx={{ p: 1.25, borderRadius: 1.5, bgcolor: "action.hover" }}>
