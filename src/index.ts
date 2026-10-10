@@ -1,5 +1,6 @@
 import { serve } from "bun";
 import index from "./index.html";
+import faviconPath from "./skinny_ai.png" with { type: "file" };
 
 // ─── AI Agent harness: real Ollama tool-calling loop ───────────────────
 // The harness is the "nervous system": it sends messages + tool schemas to
@@ -170,7 +171,7 @@ const server = serve({
     // Serve the favicon file directly — otherwise the "/*" catch-all below
     // would return index.html for /skinny_ai.png and the icon breaks.
     "/skinny_ai.png": async () => {
-      const file = Bun.file(new URL("./skinny_ai.png", import.meta.url));
+      const file = Bun.file(faviconPath);
       return new Response(file, {
         headers: {
           "Content-Type": "image/png",
